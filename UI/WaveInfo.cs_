@@ -1,0 +1,522 @@
+using System.Collections;
+using System.Collections.Generic;
+using System.Linq;
+using TMPro;
+using UnityEngine;
+using UnityEngine.Assertions;
+using UnityEngine.UI;
+using XCharts;
+using XCharts.Runtime;
+
+
+public class WaveInfo : MonoBehaviour
+{
+    private static CommonData commonData = CommonData.Instance;
+    private FPMController playerController;
+    private Seismic seismic;
+
+    private Button playButton;
+    private Button pauseButton;
+    private Button stopButton;
+    private Button chartButton;
+
+    private SimplifiedLineChart NS_DispResponseChart;
+    private SimplifiedLineChart EW_DispResponseChart;
+    private SimplifiedLineChart NS_AccResponseChart;
+    private SimplifiedLineChart EW_AccResponseChart;
+    public SimplifiedLineChart NS_AccChart;
+    public SimplifiedLineChart EW_AccChart;
+    private Vector2[] NS_DispResponseData;
+    private Vector2[] EW_DispResponseData;
+    private Vector2[] NS_AccResponseData;
+    private Vector2[] EW_AccResponseData;
+    private Vector2[] NS_AccData;
+    private Vector2[] EW_AccData;
+
+    private MeshDeformer buildingDeformer;
+    private GameObject sensorPanel;
+    private Slider sensorSlider;
+    private TextMeshProUGUI sensorText;
+
+    private float currentTime = 0f;
+    private float progress = 0f;
+
+    private bool chartActive = false;
+    private bool sensorValueChanged = false;
+
+    private bool enableMarkLine = false;
+    private bool enableWaveFadeIn = false;
+
+    void Awake()
+    {
+        playerController = GameObject.Find("Player").GetComponent<FPMController>();
+        seismic = GameObject.Find("Seismic").GetComponent<Seismic>();
+
+        playButton = GameObject.Find("PlayButton").GetComponent<Button>();
+        pauseButton = GameObject.Find("PauseButton").GetComponent<Button>();
+        stopButton = GameObject.Find("StopButton").GetComponent<Button>();
+        chartButton = GameObject.Find("ChartButton").GetComponent<Button>();
+
+        NS_DispResponseChart = GameObject.Find("NS_DispResponseChart").GetComponent<SimplifiedLineChart>();
+        EW_DispResponseChart = GameObject.Find("EW_DispResponseChart").GetComponent<SimplifiedLineChart>();
+        NS_AccResponseChart = GameObject.Find("NS_AccResponseChart").GetComponent<SimplifiedLineChart>();
+        EW_AccResponseChart = GameObject.Find("EW_AccResponseChart").GetComponent<SimplifiedLineChart>();
+        NS_AccChart = GameObject.Find("NS_AccChart").GetComponent<SimplifiedLineChart>();
+        EW_AccChart = GameObject.Find("EW_AccChart").GetComponent<SimplifiedLineChart>();
+        sensorPanel = GameObject.Find("SensorPanel");
+        sensorSlider = GameObject.Find("SensorSlider").GetComponent<Slider>();
+        sensorText = GameObject.Find("SensorText").GetComponent<TextMeshProUGUI>();
+
+        NS_DispResponseData = new Vector2[1] { new Vector2(1f, 1f) };
+        EW_DispResponseData = new Vector2[1] { new Vector2(1f, 1f) };
+        NS_AccResponseData = new Vector2[1] { new Vector2(1f, 1f) };
+        EW_AccResponseData = new Vector2[1] { new Vector2(1f, 1f) };
+        NS_AccData = new Vector2[1] { new Vector2(1f, 1f) };
+        EW_AccData = new Vector2[1] { new Vector2(1f, 1f) };
+        InitChart(NS_DispResponseChart, NS_DispResponseData);
+        InitChart(EW_DispResponseChart, EW_DispResponseData);
+        InitChart(NS_AccResponseChart, NS_AccResponseData);
+        InitChart(EW_AccResponseChart, EW_AccResponseData);
+        InitChart(NS_AccChart, NS_AccData);
+        InitChart(EW_AccChart, EW_AccData);
+
+        EnableUI(false);
+
+        Assert.IsNotNull(playButton);
+        Assert.IsNotNull(pauseButton);
+        Assert.IsNotNull(stopButton);
+        Assert.IsNotNull(chartButton);
+        Assert.IsNotNull(NS_DispResponseChart);
+        Assert.IsNotNull(EW_DispResponseChart);
+        Assert.IsNotNull(NS_AccResponseChart);
+        Assert.IsNotNull(EW_AccResponseChart);
+        Assert.IsNotNull(NS_AccChart);
+        Assert.IsNotNull(EW_AccChart);
+        Assert.IsNotNull(sensorPanel);
+
+        playButton.onClick.AddListener(OnPlayButtonClick);
+        pauseButton.onClick.AddListener(OnPauseButtonClick);
+        stopButton.onClick.AddListener(OnStopButtonClick);
+        chartButton.onClick.AddListener(OnChartButtonClick);
+        sensorSlider.onValueChanged.AddListener(_ => sensorValueChanged = true);
+    }
+
+    void InitWaveInfo()
+    {
+        NS_DispResponseData = new Vector2[1] { new Vector2(1f, 1f) };
+        EW_DispResponseData = new Vector2[1] { new Vector2(1f, 1f) };
+        NS_AccResponseData = new Vector2[1] { new Vector2(1f, 1f) };
+        EW_AccResponseData = new Vector2[1] { new Vector2(1f, 1f) };
+
+        InitChart(NS_DispResponseChart, NS_DispResponseData);
+        InitChart(EW_DispResponseChart, EW_DispResponseData);
+        InitChart(NS_AccResponseChart, NS_AccResponseData);
+        InitChart(EW_AccResponseChart, EW_AccResponseData);
+
+        float[] simplifiedNorth;
+        float simplifiedNorthDt;
+        float[] simplifiedEast;
+        float simplifiedEastDt;
+
+        CommonData.SimplifyData(seismic.north, seismic.data.dt, out simplifiedNorth, out simplifiedNorthDt);
+        CommonData.SimplifyData(seismic.east, seismic.data.dt, out simplifiedEast, out simplifiedEastDt);
+
+        NS_AccData = new Vector2[simplifiedNorth.Length];
+        for (int i = 0; i < simplifiedNorth.Length; i++)
+        {
+            NS_AccData[i] = new Vector2(simplifiedNorthDt * i, simplifiedNorth[i]);
+        }
+        EW_AccData = new Vector2[simplifiedEast.Length];
+        for (int i = 0; i < simplifiedEast.Length; i++)
+        {
+            EW_AccData[i] = new Vector2(simplifiedEastDt * i, simplifiedEast[i]);
+        }
+
+        InitChart(NS_AccChart, NS_AccData);
+        InitChart(EW_AccChart, EW_AccData);
+
+        buildingDeformer = null;
+        sensorSlider.minValue = 0f;
+        sensorSlider.maxValue = 0f;
+        sensorSlider.value = 0f;
+        sensorText.text = "Boop! Set the height ^_^";
+
+        SetTime(0f);
+    }
+
+    public void EnableUI(bool enable)
+    {
+        playButton.interactable = enable;
+        pauseButton.interactable = enable;
+        stopButton.interactable = enable;
+        chartButton.interactable = enable;
+
+        if (enable)
+        {
+            InitWaveInfo();
+        }
+        else
+        {
+            chartActive = false;
+            NS_DispResponseChart.gameObject.SetActive(false);
+            EW_DispResponseChart.gameObject.SetActive(false);
+            NS_AccResponseChart.gameObject.SetActive(false);
+            EW_AccResponseChart.gameObject.SetActive(false);
+            NS_AccChart.gameObject.SetActive(false);
+            EW_AccChart.gameObject.SetActive(false);
+            sensorPanel.SetActive(false);
+        }
+    }
+
+    // Update is called once per frame
+    void Update()
+    {
+        if (Input.GetKeyDown(KeyCode.T))
+        {
+            // playerController.playerCamera
+            Ray ray = playerController.playerCamera.ScreenPointToRay(new Vector3(Screen.width / 2, Screen.height / 2, 0));
+            RaycastHit hit;
+
+            // Debug.Log("Raycast " + ray.origin + " " + ray.direction);
+            // Debug.DrawLine(ray.origin, ray.origin + ray.direction * 100, Color.red, 3f);
+            // Create a line renderer to visualize the ray in game
+            GameObject lineObj = new GameObject("RayVisualization");
+            LineRenderer lineRenderer = lineObj.AddComponent<LineRenderer>();
+            lineRenderer.startWidth = 0.01f;
+            lineRenderer.endWidth = 0.01f;
+            lineRenderer.material = new Material(Shader.Find("Sprites/Default"));
+            lineRenderer.startColor = Color.red;
+            lineRenderer.endColor = Color.red;
+            lineRenderer.positionCount = 2;
+            lineRenderer.SetPosition(0, ray.origin);
+            lineRenderer.SetPosition(1, ray.origin + ray.direction * 1000f);
+            lineRenderer.startWidth = 0.5f;
+            lineRenderer.endWidth = 0.5f;
+            Destroy(lineObj, 3f); // Remove the visualization after 3 seconds
+
+            if (chartActive && Physics.Raycast(ray, out hit, 1500f, LayerMask.GetMask("MeshDeformer")))
+            {
+                MeshDeformer deformer = hit.collider.GetComponent<MeshDeformer>();
+                if (deformer != null)
+                {
+                    Debug.Log("WaveInfo.cs - Raycast Hit " + deformer.gameObject.name);
+                    // Debug.Log("WaveInfo.cs - Max X Disp: " + deformer.xSolver.maxDisplacement);
+                    // Debug.Log("WaveInfo.cs - Max Z Disp: " + deformer.zSolver.maxDisplacement);
+                    // Debug.Log("WaveInfo.cs - Max X Acc: " + deformer.xSolver.maxAcceleration);
+                    // Debug.Log("WaveInfo.cs - Max Z Acc: " + deformer.zSolver.maxAcceleration);
+                    buildingDeformer = deformer;
+
+                    sensorSlider.maxValue = deformer.northConfig.levels * deformer.northConfig.levelHeight;
+                    sensorSlider.value = sensorSlider.maxValue;
+                    SetSensorHeight(sensorSlider.value);
+                }
+            }
+        }
+
+        // if (sensorValueChanged && Input.GetMouseButtonUp(0))
+        if (sensorValueChanged)
+        {
+            SetSensorHeight(sensorSlider.value);
+        }
+    }
+
+    void OnPlayButtonClick()
+    {
+        seismic.Play();
+    }
+
+    void OnPauseButtonClick()
+    {
+        seismic.Pause();
+    }
+
+    void OnStopButtonClick()
+    {
+        seismic.Stop();
+    }
+
+    void OnChartButtonClick()
+    {
+        chartActive = !chartActive;
+        NS_DispResponseChart.gameObject.SetActive(chartActive);
+        EW_DispResponseChart.gameObject.SetActive(chartActive);
+        NS_AccResponseChart.gameObject.SetActive(chartActive);
+        EW_AccResponseChart.gameObject.SetActive(chartActive);
+        NS_AccChart.gameObject.SetActive(chartActive);
+        EW_AccChart.gameObject.SetActive(chartActive);
+        sensorPanel.SetActive(chartActive);
+
+        UpdateAllChartProgress();
+    }
+
+    void SetSensorHeight(float height)
+    {
+        sensorValueChanged = false;
+
+        if (buildingDeformer == null) return;
+        sensorText.text = "Height: " + height.ToString("F1") + "m";
+
+        {
+            // float[] xDispResponse = buildingDeformer.xSolver.GetAllDisplacementResponseInterpolated(height);
+            // float[] zDispResponse = buildingDeformer.zSolver.GetAllDisplacementResponseInterpolated(height);
+            // float[] northDispResponse;
+            // float[] eastDispResponse;
+            // CommonData.AxisToDirection(xDispResponse, zDispResponse, out northDispResponse, out eastDispResponse);
+
+            float[] northDispResponse = buildingDeformer.northSolver.GetAllDisplacementResponseInterpolated(height);
+            float[] eastDispResponse = buildingDeformer.eastSolver.GetAllDisplacementResponseInterpolated(height);
+
+            float[] simplifiedNorth;
+            float simplifiedNorthDt;
+            float[] simplifiedEast;
+            float simplifiedEastDt;
+
+            CommonData.SimplifyData(northDispResponse, seismic.data.dt, out simplifiedNorth, out simplifiedNorthDt);
+            CommonData.SimplifyData(eastDispResponse, seismic.data.dt, out simplifiedEast, out simplifiedEastDt);
+
+            NS_DispResponseData = new Vector2[simplifiedNorth.Length];
+            for (int i = 0; i < simplifiedNorth.Length; i++)
+            {
+                NS_DispResponseData[i] = new Vector2(simplifiedNorthDt * i, simplifiedNorth[i]);
+            }
+            EW_DispResponseData = new Vector2[simplifiedEast.Length];
+            for (int i = 0; i < simplifiedEast.Length; i++)
+            {
+                EW_DispResponseData[i] = new Vector2(simplifiedEastDt * i, simplifiedEast[i]);
+            }
+
+            InitChart(NS_DispResponseChart, NS_DispResponseData);
+            InitChart(EW_DispResponseChart, EW_DispResponseData);
+        }
+
+        {
+            // float[] xAccResponse = buildingDeformer.xSolver.GetAllAccelerationResponseInterpolated(height);
+            // float[] zAccResponse = buildingDeformer.zSolver.GetAllAccelerationResponseInterpolated(height);
+            // float[] northAccResponse;
+            // float[] eastAccResponse;
+            // CommonData.AxisToDirection(xAccResponse, zAccResponse, out northAccResponse, out eastAccResponse);
+
+            float[] northAccResponse = buildingDeformer.northSolver.GetAllAccelerationResponseInterpolated(height);
+            float[] eastAccResponse = buildingDeformer.eastSolver.GetAllAccelerationResponseInterpolated(height);
+
+            float[] simplifiedNorth;
+            float simplifiedNorthDt;
+            float[] simplifiedEast;
+            float simplifiedEastDt;
+
+            CommonData.SimplifyData(northAccResponse, seismic.data.dt, out simplifiedNorth, out simplifiedNorthDt);
+            CommonData.SimplifyData(eastAccResponse, seismic.data.dt, out simplifiedEast, out simplifiedEastDt);
+
+            NS_AccResponseData = new Vector2[simplifiedNorth.Length];
+            for (int i = 0; i < simplifiedNorth.Length; i++)
+            {
+                NS_AccResponseData[i] = new Vector2(simplifiedNorthDt * i, simplifiedNorth[i]);
+            }
+            EW_AccResponseData = new Vector2[simplifiedEast.Length];
+            for (int i = 0; i < simplifiedEast.Length; i++)
+            {
+                EW_AccResponseData[i] = new Vector2(simplifiedEastDt * i, simplifiedEast[i]);
+            }
+
+            InitChart(NS_AccResponseChart, NS_AccResponseData);
+            InitChart(EW_AccResponseChart, EW_AccResponseData);
+        }
+    }
+
+    public void InitChart(SimplifiedLineChart chart, Vector2[] data)
+    {
+        // // Reduce the number of data points to avoid performance issues
+        // const int maxDataPoints = 600;
+        // if (data.Length > maxDataPoints)
+        // {
+        //     int groupSize = (data.Length + maxDataPoints - 1) / maxDataPoints;
+        //     float[] newData = new float[(data.Length + groupSize - 1) / groupSize];
+        //     for (int i = 0; i < newData.Length; ++i)
+        //     {
+        //         int start = i * groupSize;
+        //         int end = Mathf.Min(start + groupSize, data.Length);
+        //         float sum = 0;
+        //         for (int j = start; j < end; ++j)
+        //         {
+        //             sum += data[j];
+        //         }
+        //         newData[i] = sum / (end - start);
+        //     }
+        //     data = newData;
+        //     dt *= groupSize;
+        // }
+
+
+        // chart.ClearData();
+        // chart.RemoveData();
+
+        var gridCoord = chart.GetChartComponent<GridCoord>();
+        gridCoord.left = 0.2f;
+
+        chart.onPointerClick = (_, _) =>
+        {
+            var gridCoord = chart.GetChartComponent<GridCoord>();
+            var leftPos = chart.chartWidth * gridCoord.left;
+            var rightPos = chart.chartWidth * (1 - gridCoord.right);
+            float p = (chart.pointerPos.x - leftPos) / (rightPos - leftPos);
+            seismic.SetTime(p * seismic.duration);
+        };
+
+        var xAxis = chart.GetChartComponent<XAxis>();
+        xAxis.show = true;
+        xAxis.type = Axis.AxisType.Value;
+        xAxis.axisLabel.formatter = "{value:f1}";
+        // xAxis.minMaxType = Axis.AxisMinMaxType.MinMax;
+        // xAxis.splitNumber = 5;
+        xAxis.minMaxType = Axis.AxisMinMaxType.Custom;
+        xAxis.min = 0;
+        xAxis.max = seismic.duration;
+
+        var yAxis = chart.GetChartComponent<YAxis>();
+        yAxis.show = true;
+        yAxis.type = Axis.AxisType.Value;
+        yAxis.axisLabel.formatter = "{value:f5}";
+        // yAxis.minMaxType = Axis.AxisMinMaxType.MinMax;
+        yAxis.minMaxType = Axis.AxisMinMaxType.Custom;
+        yAxis.min = data.Min(d => d.y);
+        yAxis.max = data.Max(d => d.y);
+
+        // Sort the y values to find the percentile
+        // var sortedValues = data.Select(d => d.y).OrderBy(y => y).ToArray();
+        // int length = sortedValues.Length;
+        // int minIndex = Mathf.Clamp(Mathf.RoundToInt(0.1f * length), 0, length - 1);
+        // int maxIndex = Mathf.Clamp(Mathf.RoundToInt(0.9f * length), 0, length - 1);
+        // yAxis.min = sortedValues[minIndex];
+        // yAxis.max = sortedValues[maxIndex];
+        // for (int i = 0; i < data.Length; i++)
+        // {
+        //     data[i].y = Mathf.Clamp(data[i].y, sortedValues[minIndex], sortedValues[maxIndex]);
+        // }
+
+        yAxis.splitNumber = 3;
+
+
+        var tooltip = chart.GetChartComponent<Tooltip>();
+        tooltip.show = false;
+        tooltip.type = Tooltip.Type.Line;
+        // tooltip.titleFormatter = "";
+        // tooltip.itemFormatter = "{c2:f2}";
+
+        var serie0 = chart.GetSerie(0);
+        serie0.sampleDist = 2f;
+        serie0.sampleType = SampleType.Peak;
+
+
+        chart.EnsureChartComponent<MarkLine>();
+
+        var markLine = chart.EnsureChartComponent<MarkLine>();
+        markLine.show = enableMarkLine;
+        // markLine.data.Clear();
+
+        // for (int i = 0; i < data.Length; i++)
+        // {
+        //     chart.AddData(0, dt * i, data[i]);
+        // }
+
+        SetChartMarkLine(chart);
+        SetChartProgress(chart, data);
+
+        chart.AnimationEnable(false);
+        // chart.AnimationEnable(true);
+        // serie0.animation.fadeIn.duration = 10000f;
+        // serie0.animation.fadeIn.delay = -5000f;
+        // chart.AnimationFadeIn();
+        // serie0.animation.fadeIn.context.destProgress = 0.5f;
+    }
+
+    public void EnableChartMarkLine(SimplifiedLineChart chart, bool enable)
+    {
+        var markLine = chart.GetChartComponent<MarkLine>();
+        markLine.show = enable;
+
+        SetChartMarkLine(chart);
+    }
+
+    public void SetChartMarkLine(SimplifiedLineChart chart)
+    {
+        var markLine = chart.EnsureChartComponent<MarkLine>();
+        markLine.show = enableMarkLine;
+        markLine.data.Clear();
+
+        if (0f < progress && progress <= 1f)
+        {
+            var gridCoord = chart.GetChartComponent<GridCoord>();
+            markLine.data.Add(new MarkLineData()
+            {
+                type = MarkLineType.None,
+                xPosition = chart.chartWidth * (1.0f - gridCoord.left - gridCoord.right) * progress,
+                lineStyle = new LineStyle()
+                {
+                    color = Color.red,
+                }
+            });
+        }
+    }
+
+    public void SetChartProgress(SimplifiedLineChart chart, Vector2[] data)
+    {
+        var serie0 = chart.GetSerie(0);
+        int showCount = enableWaveFadeIn ? Mathf.Clamp(Mathf.RoundToInt(data.Length * progress), 0, data.Length) : data.Length;
+
+        serie0.ClearData();
+        for (int i = 1; i <= showCount; i++)
+        {
+            serie0.AddData(data[i - 1].x, data[i - 1].y);
+        }
+
+        chart.AnimationEnable(false);
+    }
+
+    public void UpdateAllChartProgress()
+    {
+        SetChartProgress(NS_DispResponseChart, NS_DispResponseData);
+        SetChartProgress(EW_DispResponseChart, EW_DispResponseData);
+        SetChartProgress(NS_AccResponseChart, NS_AccResponseData);
+        SetChartProgress(EW_AccResponseChart, EW_AccResponseData);
+        SetChartProgress(NS_AccChart, NS_AccData);
+        SetChartProgress(EW_AccChart, EW_AccData);
+    }
+
+    public void SetTime(float t)
+    {
+        currentTime = t;
+        progress = t / seismic.duration;
+
+        if (enableMarkLine)
+        {
+            SetChartMarkLine(NS_DispResponseChart);
+            SetChartMarkLine(EW_DispResponseChart);
+            SetChartMarkLine(NS_AccResponseChart);
+            SetChartMarkLine(EW_AccResponseChart);
+            SetChartMarkLine(NS_AccChart);
+            SetChartMarkLine(EW_AccChart);
+        }
+
+        if (chartActive && enableWaveFadeIn)
+        {
+            UpdateAllChartProgress();
+        }
+    }
+
+    public void EnableMarkLine(bool enable)
+    {
+        enableMarkLine = enable;
+        EnableChartMarkLine(NS_DispResponseChart, enable);
+        EnableChartMarkLine(EW_DispResponseChart, enable);
+        EnableChartMarkLine(NS_AccResponseChart, enable);
+        EnableChartMarkLine(EW_AccResponseChart, enable);
+        EnableChartMarkLine(NS_AccChart, enable);
+        EnableChartMarkLine(EW_AccChart, enable);
+    }
+
+    public void EnableWaveFadeIn(bool enable)
+    {
+        enableWaveFadeIn = enable;
+        UpdateAllChartProgress();
+    }
+}

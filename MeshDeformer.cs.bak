@@ -1,0 +1,405 @@
+/*
+ * MeshDeformer.cs
+ *
+ * 此脚本用于网格变形，以可视化地震或其他灾害对3D结构的影响。
+ * 它通过在不同高度层级对顶点应用位移和旋转变换来实现。
+ *
+ * 主要功能：
+ * - 查找并处理层级结构中的所有网格
+ * - 根据高度将顶点组织到不同层级，实现渐进式变形效果
+ * - 使用计算缓冲区和基于着色器的渲染以提高变形效率
+ * - 提供内部结构可视化和基于响应强度的颜色编码控制
+ * - 与Solver1D接口连接，用于计算随时间变化的位移值
+ *
+ * 该类采用GPU加速方法，将顶点和响应数据传输到计算缓冲区，
+ * 然后通过自定义着色器("Unlit/MeshDeformer")应用变换。
+ *
+ * 包含：
+ * - VertexData：存储顶点信息的结构，包括位置、UV坐标和插值值
+ * - MeshComputer：管理结构中每个网格的网格数据和计算缓冲区的内部类
+ * - ResponseData：包含位移、旋转和着色信息的结构（在其他地方定义）
+ *
+ * 编辑器扩展允许切换内部结构可见性和响应着色，用于可视化目的。
+ */
+using System.Collections;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+#if UNITY_EDITOR
+using UnityEditor;
+#endif
+using UnityEngine;
+using static UnityEngine.Mathf;
+
+public class MeshDeformer : MonoBehaviour
+{
+    private static CommonData commonData = CommonData.Instance;
+    // public Solver1D.Config xConfig, zConfig;
+    // public Solver1D xSolver, zSolver;
+    public Solver1D.Config northConfig, eastConfig;
+    public Solver1D northSolver, eastSolver;
+    public int numLevels;
+    public float totalHeight;
+    float minHeight = float.MaxValue;
+    float maxHeight = float.MinValue;
+    ResponseData[] responseData;
+    ComputeBuffer responseBuffer;
+    private BoxCollider boxCollider;
+
+    [StructLayout(LayoutKind.Sequential)]
+    struct VertexData
+    {
+        public Vector3 position;
+        public Vector3 normal;
+        public Vector2 uv;
+        public int baseLevel;
+        public float lerpValue;
+
+        static public int Size()
+        {
+            return sizeof(float) * 3
+                + sizeof(float) * 3
+                + sizeof(float) * 2
+                + sizeof(int)
+                + sizeof(float);
+        }
+    }
+
+    class MeshComputer
+    {
+        public MeshFilter meshFilter;
+        public MeshRenderer meshRenderer;
+        public Mesh mesh;
+        public bool hasTexture;
+        public int vertexCount;
+        public VertexData[] vertexData;
+        public ComputeBuffer vertexBuffer;
+        // public int kernel;
+        // public ComputeShader shader;
+
+        public MeshComputer(MeshFilter meshFilter, MeshRenderer meshRenderer)
+        {
+            this.meshFilter = meshFilter;
+            this.meshRenderer = meshRenderer;
+            mesh = meshFilter.mesh;
+            vertexCount = mesh.vertexCount;
+            vertexData = new VertexData[vertexCount];
+
+            var vertices = mesh.vertices;
+            var normals = mesh.normals;
+            for (int i = 0; i < vertexCount; ++i)
+            {
+                vertexData[i].position = vertices[i];
+                vertexData[i].normal = normals[i];
+            }
+
+            hasTexture = meshRenderer.material.mainTexture != null;
+            if (hasTexture)
+            {
+                var uv = mesh.uv;
+                for (int i = 0; i < vertexCount; ++i) vertexData[i].uv = uv[i];
+            }
+            else
+            {
+                meshRenderer.enabled = false;
+            }
+
+            // shader = Resources.Load<ComputeShader>("VertexCompute");
+            // kernel = shader.FindKernel("CSMain");
+        }
+    }
+
+    List<MeshComputer> meshComputers = new List<MeshComputer>();
+    int meshCount;
+
+    public int vertexCount = 0;
+
+    // public float currentTime = 0f;
+    // public bool isPlaying = false;
+    // public bool isStopped = false;
+
+    void FindMeshes(Transform parent)
+    {
+        var meshFilter = parent.GetComponent<MeshFilter>();
+        var meshRenderer = parent.GetComponent<MeshRenderer>();
+        if (meshFilter != null && meshRenderer != null)
+        {
+            meshComputers.Add(new MeshComputer(meshFilter, meshRenderer));
+            vertexCount += meshFilter.mesh.vertexCount;
+        }
+        foreach (Transform child in parent) FindMeshes(child);
+    }
+
+    void Awake()
+    {
+        FindMeshes(transform);
+        meshCount = meshComputers.Count;
+
+        // 初始化用于计算整体包围盒的变量
+        Vector3 minBounds = new Vector3(float.MaxValue, float.MaxValue, float.MaxValue);
+        Vector3 maxBounds = new Vector3(float.MinValue, float.MinValue, float.MinValue);
+
+        for (int i = 0; i < meshCount; ++i)
+        {
+            var meshComputer = meshComputers[i];
+            var transform = meshComputer.meshFilter.transform;
+            for (int j = 0; j < meshComputers[i].vertexCount; ++j)
+            {
+                var worldPosition = transform.TransformPoint(meshComputer.vertexData[j].position);
+
+                minHeight = Min(minHeight, worldPosition.y);
+                maxHeight = Max(maxHeight, worldPosition.y);
+                meshComputer.vertexData[j].lerpValue = worldPosition.y;
+
+                minBounds = Vector3.Min(minBounds, worldPosition);
+                maxBounds = Vector3.Max(maxBounds, worldPosition);
+            }
+        }
+
+        Vector3 worldBoxCenter = (minBounds + maxBounds) * 0.5f;
+        Vector3 localBoxCenter = transform.InverseTransformPoint(worldBoxCenter);
+        Vector3 worldSize = maxBounds - minBounds;
+        // Vector3 localSize
+
+        boxCollider = gameObject.AddComponent<BoxCollider>();
+        boxCollider.center = localBoxCenter;
+        boxCollider.size = worldSize;
+
+        // gameObject.AddComponent<AutoMeshColliderAdder>();
+
+        // set raycast layer
+        gameObject.layer = LayerMask.NameToLayer("MeshDeformer");
+
+
+        totalHeight = maxHeight - minHeight;
+        numLevels = CeilToInt(totalHeight / 3.5f);
+        responseData = new ResponseData[numLevels + 1];
+        for (int i = 0; i <= numLevels; ++i)
+        {
+            responseData[i].displacement = Vector3.zero;
+            responseData[i].rotation = Vector3.zero;
+            responseData[i].red = 0f;
+        }
+
+        responseBuffer = new ComputeBuffer(numLevels + 1, ResponseData.Size());
+        responseBuffer.SetData(responseData);
+
+        for (int i = 0; i < meshCount; ++i)
+        {
+            var meshComputer = meshComputers[i];
+            for (int j = 0; j < meshComputer.vertexCount; ++j)
+            {
+                meshComputer.vertexData[j].baseLevel = Clamp((int)((meshComputer.vertexData[j].lerpValue - minHeight) / 3.5f), 0, numLevels - 1);
+                meshComputer.vertexData[j].lerpValue = (meshComputer.vertexData[j].lerpValue - minHeight) / 3.5f - meshComputer.vertexData[j].baseLevel;
+            }
+
+            meshComputer.vertexBuffer = new ComputeBuffer(meshComputer.vertexCount, VertexData.Size());
+            meshComputer.vertexBuffer.SetData(meshComputer.vertexData);
+
+            // create from a shader
+            // Material material = new Material(Shader.Find("Unlit/MeshDeformer"));
+            Material material = new Material(Shader.Find("Custom/MeshDeformerStandard"));
+            material.SetTexture("_MainTex", meshComputer.meshRenderer.material.mainTexture);
+            material.SetBuffer("vertexBuffer", meshComputer.vertexBuffer);
+            material.SetBuffer("responseBuffer", responseBuffer);
+            material.SetInteger("_EnableTexture", meshComputer.hasTexture ? 1 : 0);
+            material.SetInteger("_EnableColoring", 0);
+            // material.SetFloat("_Glossiness", 0.5f);
+            // material.SetFloat("_Metallic", 0f);
+            // enable gpu instancing
+            material.enableInstancing = true;
+
+            meshComputer.meshRenderer.material = material;
+        }
+
+        // xConfig = new Solver1D.Config()
+        // {
+        //     levels = numLevels,
+        //     levelHeight = 3.5f,
+        //     mode = ShakeMode.ModeShape,
+        //     coloringType = ColoringType.Displacement,
+        // };
+        // zConfig = new Solver1D.Config()
+        // {
+        //     levels = numLevels,
+        //     levelHeight = 3.5f,
+        //     mode = ShakeMode.ModeShape,
+        //     modeShape = 2,
+        //     coloringType = ColoringType.Displacement,
+        // };
+
+        // xSolver = new Solver1D(xConfig);
+        // zSolver = new Solver1D(zConfig);
+    }
+
+    void Update()
+    {
+        // if (isStopped)
+        // {
+        //     for (int i = 0; i <= numLevels; ++i)
+        //     {
+        //         responseData[i].displacement = Vector3.zero;
+        //         responseData[i].rotation = Vector3.zero;
+        //         responseData[i].red = 0f;
+        //     }
+        //     responseBuffer.SetData(responseData);
+        //     currentTime = 0f;
+        //     isPlaying = false;
+        //     isStopped = false;
+        //     return;
+        // }
+
+        // if (!isPlaying) return;
+
+        // currentTime += Time.deltaTime;
+        // xSolver.SetTime(currentTime);
+        // zSolver.SetTime(currentTime);
+
+        // for (int i = 0; i <= numLevels; ++i)
+        // {
+        //     Vector3 xResponse = xSolver.GetResponse(i);
+        //     Vector3 zResponse = zSolver.GetResponse(i);
+
+        //     responseData[i].displacement.x = xResponse.x;
+        //     responseData[i].displacement.z = zResponse.x;
+        //     responseData[i].red = xResponse.z * xResponse.z + zResponse.z * zResponse.z;
+
+        //     // responseData[i].displacement.x = 50 * Sin(currentTime);
+        //     // responseData[i].displacement.z = 50 * Sin(currentTime);
+        //     // responseData[i].red = (Sin(currentTime) + 1) / 2;
+
+        //     // 1/10000的概率输出
+        //     // if (Random.Range(0, 10000) == 0)
+        //     // {
+        //     //     Debug.Log("Displacement: " + responseData[i].displacement);
+        //     // }
+
+        // }
+        // responseBuffer.SetData(responseData);
+    }
+
+    public void SetTime(float t)
+    {
+        if (northSolver == null || eastSolver == null) return;
+        // xSolver.SetTime(t);
+        // zSolver.SetTime(t);
+        northSolver.SetTime(t);
+        eastSolver.SetTime(t);
+
+        for (int i = 0; i <= numLevels; ++i)
+        {
+            // Vector3 xResponse = xSolver.GetResponse(i);
+            // Vector3 zResponse = zSolver.GetResponse(i);
+
+            Vector3 northResponse = northSolver.GetResponse(i);
+            Vector3 eastResponse = eastSolver.GetResponse(i);
+
+            Vector3 xResponse, zResponse;
+            CommonData.DirectionToAxis(northResponse, eastResponse, out xResponse, out zResponse);
+
+            responseData[i].displacement.x = xResponse.x * commonData.visualAmplitude;
+            responseData[i].displacement.z = zResponse.x * commonData.visualAmplitude;
+            responseData[i].red = Max(xResponse.z, zResponse.z);
+        }
+        responseBuffer.SetData(responseData);
+    }
+
+    public void Solve()
+    {
+        // 测试Solve用时，精确到ms
+        // Debug.Log("Solving...");
+        // Debug.Log("Levels: " + xSolver.config.levels);
+        // Debug.Log("nt: " + xSolver.config.nt);
+
+        // System.Diagnostics.Stopwatch stopwatch = new System.Diagnostics.Stopwatch();
+        // stopwatch.Start();
+
+        northSolver.Solve();
+        eastSolver.Solve();
+
+        // stopwatch.Stop();
+        // Debug.Log("Solve used " + stopwatch.ElapsedMilliseconds + "ms");
+    }
+
+    public void EnableInternalStructure(bool enable)
+    {
+        foreach (var meshComputer in meshComputers)
+        {
+            if (!meshComputer.hasTexture)
+            {
+                meshComputer.meshRenderer.enabled = enable; // Plants.fbx don't have texture.
+            }
+        }
+    }
+
+    public void EnableExternalStructure(bool enable)
+    {
+        foreach (var meshComputer in meshComputers)
+        {
+            if (meshComputer.hasTexture)
+            {
+                meshComputer.meshRenderer.enabled = enable; // Plants.fbx don't have texture.
+            }
+        }
+    }
+
+    public void EnableColoring(bool enable)
+    {
+        foreach (var meshComputer in meshComputers)
+        {
+            meshComputer.meshRenderer.material.SetInteger("_EnableColoring", enable ? 1 : 0);
+        }
+    }
+
+    void OnDestroy()
+    {
+        responseBuffer.Release();
+        for (int i = 0; i < meshCount; ++i)
+        {
+            meshComputers[i].vertexBuffer.Release();
+        }
+    }
+}
+
+#if UNITY_EDITOR
+[CustomEditor(typeof(MeshDeformer))]
+public class MeshDeformerEditor : Editor
+{
+    public override void OnInspectorGUI()
+    {
+        // base.OnInspectorGUI();
+        var t = (MeshDeformer)target;
+        // if (GUILayout.Button("Solve"))
+        // {
+        //     t.Solve();
+        // }
+        // if (GUILayout.Button("Play"))
+        // {
+        //     t.isPlaying = true;
+        // }
+        // if (GUILayout.Button("Pause"))
+        // {
+        //     t.isPlaying = false;
+        // }
+        // if (GUILayout.Button("Stop"))
+        // {
+        //     t.isStopped = true;
+        // }
+        // if (GUILayout.Button("Enable Internal Structure"))
+        // {
+        //     t.EnableInternalStructure(true);
+        // }
+        // if (GUILayout.Button("Disable Internal Structure"))
+        // {
+        //     t.EnableInternalStructure(false);
+        // }
+        // if (GUILayout.Button("Enable Coloring"))
+        // {
+        //     t.EnableColoring(true);
+        // }
+        // if (GUILayout.Button("Disable Coloring"))
+        // {
+        //     t.EnableColoring(false);
+        // }
+    }
+}
+#endif
