@@ -46,10 +46,6 @@ public class DasVisualizer : MonoBehaviour
     [Tooltip("通道列名前缀（默认 ch_）")]
     public string channelPrefix = "ch_";
 
-    [Header("颜色映射")]
-    [Tooltip("定义热力图的颜色梯度 (0.0 -> 1.0)")]
-    public Gradient colorGradient;
-
     [Tooltip("归一化模式：Global使用全局最小最大值，PerFrame每帧自适应")]
     public NormalizationMode normalizationMode = NormalizationMode.PerFrame;
 
@@ -60,6 +56,13 @@ public class DasVisualizer : MonoBehaviour
     [Tooltip("使用百分位裁剪去除异常值 (0 = 不裁剪, 5 = 裁剪最低和最高5%)")]
     [Range(0f, 20f)]
     public float percentileClip = 2f;
+
+    [Header("形变配置")]
+    [Tooltip("信号强度映射到凸起高度的缩放系数")]
+    public float heightScale = 1f;
+
+    [Tooltip("凸起方向（与LineRenderer坐标系一致，受useWorldSpace影响）")]
+    public Vector3 displacementDirection = Vector3.up;
 
     [Header("线路配置")]
     [Tooltip("多段折线控制点（至少2个）。与LineRenderer坐标系一致，受useWorldSpace影响")]
@@ -79,9 +82,8 @@ public class DasVisualizer : MonoBehaviour
     // --- 内部状态 ---
     private DasData data;
     private LineRenderer lineRenderer;
-    private Vector3[] sampledPositions;
-    private Texture2D dasTexture;
-    private Material runtimeMaterial;
+    private Vector3[] basePositions;
+    private Vector3[] deformedPositions;
 
     private float totalDuration;
     private bool isPaused;
@@ -119,20 +121,13 @@ public class DasVisualizer : MonoBehaviour
 
         if (sampleCount < 1)
         {
-            Debug.LogError("数据长度为0，无法绘制热力线。");
+            Debug.LogError("数据长度为0，无法绘制折线。");
             return;
         }
 
         BuildPolylineSamples(sampleCount);
 
-        // 4. 创建 1D 纹理并绑定到材质，以纹理方式呈现所有通道颜色
-        dasTexture = new Texture2D(sampleCount, 1, TextureFormat.RGBA32, false, false);
-        dasTexture.wrapMode = TextureWrapMode.Clamp;
-        dasTexture.filterMode = FilterMode.Bilinear;
-
-        runtimeMaterial = new Material(Shader.Find("Unlit/Texture"));
-        runtimeMaterial.mainTexture = dasTexture;
-        lineRenderer.material = runtimeMaterial;
+        // 4. 初始化显示：使用折线形变表达强度
         lineRenderer.alignment = LineAlignment.View;
 
         // 5. 初始化帧控制
@@ -142,7 +137,7 @@ public class DasVisualizer : MonoBehaviour
         isPaused = true;
 
         // 立即显示第一帧
-        UpdateDasTexture(data.frames[currentFrameIndex]);
+        UpdateDasGeometry(data.frames[currentFrameIndex]);
     }
 
     void Update()
@@ -158,8 +153,8 @@ public class DasVisualizer : MonoBehaviour
         {
             // 切换到下一帧 (循环播放)
             currentFrameIndex = (currentFrameIndex + 1) % data.frames.Count;
-            // 更新纹理
-            UpdateDasTexture(data.frames[currentFrameIndex]);
+            // 更新折线形变
+            UpdateDasGeometry(data.frames[currentFrameIndex]);
 
             // 重置计时器
             timer -= timePerFrame;
@@ -305,7 +300,8 @@ public class DasVisualizer : MonoBehaviour
         lineRenderer.textureMode = LineTextureMode.Stretch;
         lineRenderer.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
         lineRenderer.receiveShadows = false;
-        lineRenderer.colorGradient = new Gradient(); // 清空渐变，依赖纹理显示颜色
+        lineRenderer.startColor = Color.white;
+        lineRenderer.endColor = Color.white;
     }
 
     /// <summary>
@@ -313,14 +309,15 @@ public class DasVisualizer : MonoBehaviour
     /// </summary>
     private void BuildPolylineSamples(int count)
     {
-        sampledPositions = new Vector3[count];
+        basePositions = new Vector3[count];
+        deformedPositions = new Vector3[count];
 
         if (controlPoints == null || controlPoints.Count < 2)
         {
             Debug.LogError("需要至少两个控制点来生成折线。");
-            for (int i = 0; i < count; i++) sampledPositions[i] = Vector3.zero;
+            for (int i = 0; i < count; i++) basePositions[i] = Vector3.zero;
             lineRenderer.positionCount = count;
-            lineRenderer.SetPositions(sampledPositions);
+            lineRenderer.SetPositions(basePositions);
             return;
         }
 
@@ -338,7 +335,7 @@ public class DasVisualizer : MonoBehaviour
         if (total <= Mathf.Epsilon)
         {
             Vector3 p = controlPoints[0];
-            for (int i = 0; i < count; i++) sampledPositions[i] = p;
+            for (int i = 0; i < count; i++) basePositions[i] = p;
         }
         else
         {
@@ -354,7 +351,7 @@ public class DasVisualizer : MonoBehaviour
                     if (targetDist <= acc + segLen || s == segmentCount - 1)
                     {
                         float localT = segLen <= Mathf.Epsilon ? 0f : (targetDist - acc) / segLen;
-                        sampledPositions[i] = Vector3.Lerp(controlPoints[s], controlPoints[s + 1], localT);
+                        basePositions[i] = Vector3.Lerp(controlPoints[s], controlPoints[s + 1], localT);
                         break;
                     }
                     acc += segLen;
@@ -363,28 +360,21 @@ public class DasVisualizer : MonoBehaviour
         }
 
         lineRenderer.positionCount = count;
-        lineRenderer.SetPositions(sampledPositions);
+        lineRenderer.SetPositions(basePositions);
     }
 
     /// <summary>
-    /// 将一帧的归一化数据写入 1D 纹理，沿折线显示全部通道颜色。
+    /// 将一帧的归一化数据映射为折线形变（凸起）。
     /// </summary>
-    private void UpdateDasTexture(DasFrame frame)
+    private void UpdateDasGeometry(DasFrame frame)
     {
-        if (lineRenderer == null || frame.values == null || dasTexture == null) return;
+        if (lineRenderer == null || frame.values == null) return;
 
         int count = frame.values.Length;
-        if (count != sampledPositions?.Length)
+        if (count != basePositions?.Length)
         {
             // 数据长度变化时重新采样位置，以保持一一对应
             BuildPolylineSamples(count);
-            // 若长度变化，需要重建纹理尺寸
-            if (dasTexture.width != count)
-            {
-                dasTexture.Reinitialize(count, 1, TextureFormat.RGBA32, false);
-                dasTexture.Apply(false, false);
-                runtimeMaterial.mainTexture = dasTexture;
-            }
         }
 
         // 计算归一化范围
@@ -426,7 +416,9 @@ public class DasVisualizer : MonoBehaviour
         float range = maxVal - minVal;
         if (range < 1e-6f) range = 1f;
 
-        Color[] colors = new Color[count];
+        Vector3 dir = displacementDirection.sqrMagnitude > 1e-6f
+            ? displacementDirection.normalized
+            : Vector3.up;
 
         for (int i = 0; i < count; i++)
         {
@@ -442,13 +434,12 @@ public class DasVisualizer : MonoBehaviour
             
             // 限制在 [0, 1] 范围
             normalizedValue = Mathf.Clamp01(normalizedValue);
-            
-            Color c = colorGradient.Evaluate(normalizedValue);
-            colors[i] = c;
+
+            // 沿指定方向产生凸起
+            deformedPositions[i] = basePositions[i] + dir * (normalizedValue * heightScale);
         }
 
-        dasTexture.SetPixels(colors);
-        dasTexture.Apply(false, false);
+        lineRenderer.SetPositions(deformedPositions);
     }
 
     public void Play()
@@ -483,7 +474,7 @@ public class DasVisualizer : MonoBehaviour
         int idx = Mathf.Min(data.frames.Count - 1, Mathf.FloorToInt(clamped / timePerFrame));
         currentFrameIndex = idx;
         timer = 0f;
-        UpdateDasTexture(data.frames[currentFrameIndex]);
+            UpdateDasGeometry(data.frames[currentFrameIndex]);
     }
 
     public float GetCurrentTime()
@@ -496,3 +487,4 @@ public class DasVisualizer : MonoBehaviour
         return totalDuration;
     }
 }
+
