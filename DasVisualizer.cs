@@ -1,173 +1,158 @@
-using UnityEngine;
+﻿using UnityEngine;
 using System.Collections.Generic;
 using System.Globalization;
 using System.IO;
-
-public enum NormalizationMode
-{
-    Global,     // 使用全局最小最大值
-    PerFrame    // 每帧自适应归一化
-}
-
+using System.Net;
+using System.Net.Sockets;
+using System.Threading;
+using System;
 public class DasFrame
 {
     public float[] values;
 }
-
 public class DasData
 {
     public int width;
     public int height;
-
     public int total_channels;
     public float fps;
-    public float global_min;
-    public float global_max;
-
     public List<DasFrame> frames;
 }
-
 public class DasVisualizer : MonoBehaviour
 {
-    [Header("数据配置")]
-    [Tooltip("CSV 文本资源（优先使用此项；为空则使用 csvFilePath 路径读取）")]
+    [Header("Data")]
+    [Tooltip("CSV TextAsset (preferred). If empty, load from csvFilePath")]
     public TextAsset csvTextAsset;
-
-        [Tooltip("CSV 文件路径（当 csvTextAsset 为空时使用；如 Assets/prob_matrix_frames.csv 或绝对路径)")]
-        public string csvFilePath = "Assets/prob_matrix_frames.csv";
-
-    [Header("CSV 预处理参数")]
-    [Tooltip("输入数据采样率（Hz），用于计算时间轴。<=0 时退回 targetFps 推动动画")]
+    [Tooltip("CSV file path when csvTextAsset is empty (e.g. Assets/prob_matrix_frames.csv)")]
+    public string csvFilePath = "Assets/prob_matrix_frames.csv";
+    [Header("Network Stream (UDP, JSON per packet)")]
+    [Tooltip("Use UDP stream input instead of CSV")]
+    public bool useNetworkStream = false;
+    [Tooltip("Local listen IP (empty = any)")]
+    public string udpListenIp = "";
+    [Tooltip("Local listen port")]
+    public int udpListenPort = 9000;
+    [Tooltip("Auto start listening")]
+    public bool autoConnectStream = true;
+    [Header("CSV Preprocess")]
+    [Tooltip("Input sample rate (Hz) for time axis. <=0 fallback to targetFps")]
     public float inputSampleRate = 2000f;
-
-    [Tooltip("目标播放帧率（fallback，当采样率无效时使用）")]
+    [Tooltip("Target FPS (fallback when sample rate invalid)")]
     public int targetFps = 30;
-
-    [Tooltip("通道列名前缀（默认 ch_）")]
+    [Tooltip("Channel column prefix (default ch_)")]
     public string channelPrefix = "ch_";
-
-    [Tooltip("归一化模式：Global使用全局最小最大值，PerFrame每帧自适应")]
-    public NormalizationMode normalizationMode = NormalizationMode.PerFrame;
-
-    [Tooltip("对比度增强倍数 (1.0 = 不增强, >1.0 = 增强对比度)")]
-    [Range(1f, 5f)]
-    public float contrastBoost = 1.5f;
-
-    [Tooltip("使用百分位裁剪去除异常值 (0 = 不裁剪, 5 = 裁剪最低和最高5%)")]
-    [Range(0f, 20f)]
-    public float percentileClip = 2f;
-
-    [Header("形变配置")]
-    [Tooltip("信号强度映射到凸起高度的缩放系数")]
+    [Header("Deformation")]
+    [Tooltip("Signal to height scale")]
     public float heightScale = 1f;
-
-    [Tooltip("凸起方向（与LineRenderer坐标系一致，受useWorldSpace影响）")]
+    [Tooltip("Raw value scale (only when normalization is off)")]
+    public float rawValueScale = 1f;
+    [Tooltip("Displacement direction (LineRenderer space)")]
     public Vector3 displacementDirection = Vector3.up;
-
-    [Header("线路配置")]
-    [Tooltip("多段折线控制点（至少2个）。与LineRenderer坐标系一致，受useWorldSpace影响")]
+    [Header("Polyline")]
+    [Tooltip("Polyline control points (>=2)")]
     public List<Vector3> controlPoints = new List<Vector3>
     {
         new Vector3(-5f, 0f, 0f),
         new Vector3(0f, 0f, 0f),
         new Vector3(5f, 0f, 0f)
     };
-
-    [Tooltip("折线宽度（仅影响显示，不影响采样数量）")]
+    [Tooltip("Line width (visual only)")]
     public float lineWidth = 0.2f;
-
-    [Tooltip("LineRenderer 使用世界坐标还是本地坐标")]
+    [Tooltip("Use world space for LineRenderer")]
     public bool useWorldSpace = false;
-
-    // --- 内部状态 ---
     private DasData data;
     private LineRenderer lineRenderer;
     private Vector3[] basePositions;
     private Vector3[] deformedPositions;
-
     private float totalDuration;
     private bool isPaused;
-
     private float timePerFrame;
     private int currentFrameIndex = 0;
     private float timer = 0f;
-
+    private UdpClient udpClient;
+    private Thread streamThread;
+    private volatile bool streamRunning;
+    private readonly object frameLock = new object();
+    private readonly Queue<DasFrame> incomingFrames = new Queue<DasFrame>();
+    [Serializable]
+    private class DasPacket
+    {
+        public int total_channels;
+        public float timestamp;
+        public float sample_rate;
+        public int sample_count;
+        public float[] signals;
+        public string timestamp_iso;
+    }
     void Start()
     {
-        // 1. 加载和解析数据（仅 CSV）
-        if (TryLoadDasFromCsv(out data) == false)
-        {
-            Debug.LogError("CSV 加载失败，已终止初始化。");
-            return;
-        }
-
-        if (data == null || data.frames == null || data.frames.Count == 0) return;
-
-        // 2. 初始化 LineRenderer（若不存在则自动添加）
         lineRenderer = GetComponent<LineRenderer>();
         if (lineRenderer == null)
         {
             lineRenderer = gameObject.AddComponent<LineRenderer>();
         }
-
         ConfigureLineRenderer();
-
-        // 3. 依据数据长度生成折线采样点
+        lineRenderer.alignment = LineAlignment.View;
+        if (useNetworkStream)
+        {
+            if (autoConnectStream) StartStream();
+            isPaused = true;
+            return;
+        }
+        if (TryLoadDasFromCsv(out data) == false)
+        {
+            Debug.LogError("CSV load failed.");
+            return;
+        }
+        if (data == null || data.frames == null || data.frames.Count == 0) return;
         int sampleCount = data.width * data.height;
         if (data.frames[0].values != null && data.frames[0].values.Length > 0)
         {
             sampleCount = data.frames[0].values.Length;
         }
-
         if (sampleCount < 1)
         {
-            Debug.LogError("数据长度为0，无法绘制折线。");
+            Debug.LogError("Data length is 0.");
             return;
         }
-
         BuildPolylineSamples(sampleCount);
-
-        // 4. 初始化显示：使用折线形变表达强度
-        lineRenderer.alignment = LineAlignment.View;
-
-        // 5. 初始化帧控制
         float effectiveFps = inputSampleRate > 0f ? inputSampleRate : Mathf.Max(1, targetFps);
         timePerFrame = 1f / effectiveFps;
         totalDuration = data.frames.Count * timePerFrame;
         isPaused = true;
-
-        // 立即显示第一帧
         UpdateDasGeometry(data.frames[currentFrameIndex]);
     }
-
     void Update()
     {
+        if (useNetworkStream)
+        {
+            DrainIncomingFrames();
+        }
         if (data == null || data.frames == null || data.frames.Count == 0) return;
         if (timePerFrame <= 0f) return;
         if (isPaused) return;
-
-        // 帧率控制逻辑
         timer += Time.deltaTime;
-
         if (timer >= timePerFrame)
         {
-            // 切换到下一帧 (循环播放)
-            currentFrameIndex = (currentFrameIndex + 1) % data.frames.Count;
-            // 更新折线形变
-            UpdateDasGeometry(data.frames[currentFrameIndex]);
-
-            // 重置计时器
+            if (useNetworkStream)
+            {
+                if (currentFrameIndex + 1 < data.frames.Count)
+                {
+                    currentFrameIndex++;
+                    UpdateDasGeometry(data.frames[currentFrameIndex]);
+                }
+            }
+            else
+            {
+                currentFrameIndex = (currentFrameIndex + 1) % data.frames.Count;
+                UpdateDasGeometry(data.frames[currentFrameIndex]);
+            }
             timer -= timePerFrame;
         }
     }
-
-    /// <summary>
-    /// 优先使用 TextAsset，其次按路径读取 CSV，并生成 DasData（不做平滑与降采样）。
-    /// </summary>
     private bool TryLoadDasFromCsv(out DasData result)
     {
         result = null;
-
         string csvContent = null;
         if (csvTextAsset != null)
         {
@@ -178,66 +163,54 @@ public class DasVisualizer : MonoBehaviour
             string resolvedPath = csvFilePath;
             if (string.IsNullOrEmpty(resolvedPath) == false && resolvedPath.StartsWith("Assets"))
             {
-                // 支持相对路径（相对于项目根）
                 resolvedPath = Path.Combine(Application.dataPath, resolvedPath.Substring("Assets".Length).TrimStart('/', '\\'));
             }
-
             if (string.IsNullOrEmpty(resolvedPath) || File.Exists(resolvedPath) == false)
             {
-                Debug.LogError($"CSV 路径无效或文件不存在: {csvFilePath}");
+                Debug.LogError($"CSV path invalid or file not found: {csvFilePath}");
                 return false;
             }
-
             try
             {
                 csvContent = File.ReadAllText(resolvedPath);
             }
             catch (System.Exception ex)
             {
-                Debug.LogError($"读取 CSV 文件失败: {ex.Message}");
+                Debug.LogError($"Read CSV failed: {ex.Message}");
                 return false;
             }
         }
-
         if (string.IsNullOrEmpty(csvContent))
         {
-            Debug.LogError("CSV 内容为空。");
+            Debug.LogError("CSV is empty.");
             return false;
         }
-
         try
         {
             result = ParseAndProcessCsv(csvContent);
-            Debug.Log($"CSV 数据加载成功! 尺寸: {result.width}x{result.height}, 帧数: {result.frames.Count}");
+            Debug.Log($"CSV loaded. Size: {result.width}x{result.height}, Frames: {result.frames.Count}");
             return true;
         }
         catch (System.Exception ex)
         {
-            Debug.LogError($"CSV 解析失败: {ex.Message}");
+            Debug.LogError($"CSV parse failed: {ex.Message}");
             return false;
         }
     }
-
-    /// <summary>
-    /// 解析 CSV，提取以 channelPrefix 开头的列，逐行作为帧返回。
-    /// </summary>
     private DasData ParseAndProcessCsv(string csvContent)
     {
         var lines = csvContent.Split(new[] { '\n', '\r' }, System.StringSplitOptions.RemoveEmptyEntries);
-        if (lines.Length < 2) throw new System.Exception("CSV 行数不足。");
-
+        if (lines.Length < 2) throw new System.Exception("CSV lines insufficient.");
         string[] headers = lines[0].Split(',');
         List<int> channelIndices = new List<int>();
         for (int i = 0; i < headers.Length; i++)
         {
             if (headers[i].StartsWith(channelPrefix)) channelIndices.Add(i);
         }
-        if (channelIndices.Count == 0) throw new System.Exception($"未找到以 '{channelPrefix}' 开头的通道列。");
-
+        if (channelIndices.Count == 0) throw new System.Exception($"No columns start with '{channelPrefix}'.");
         int totalChannels = channelIndices.Count;
         List<float[]> rows = new List<float[]>();
         NumberFormatInfo nfi = CultureInfo.InvariantCulture.NumberFormat;
-
         for (int li = 1; li < lines.Length; li++)
         {
             if (string.IsNullOrWhiteSpace(lines[li])) continue;
@@ -255,47 +228,27 @@ public class DasVisualizer : MonoBehaviour
             }
             rows.Add(row);
         }
-
         int sampleCount = rows.Count;
-        if (sampleCount == 0) throw new System.Exception("CSV 数据行为空。");
-
+        if (sampleCount == 0) throw new System.Exception("CSV data rows empty.");
         List<DasFrame> frames = new List<DasFrame>(sampleCount);
         foreach (var r in rows)
         {
             frames.Add(new DasFrame { values = r });
         }
-
-        float gMin = float.MaxValue;
-        float gMax = float.MinValue;
-        foreach (var f in frames)
-        {
-            foreach (var v in f.values)
-            {
-                if (v < gMin) gMin = v;
-                if (v > gMax) gMax = v;
-            }
-        }
-
         return new DasData
         {
             width = totalChannels,
             height = 1,
             total_channels = totalChannels,
             fps = Mathf.Max(1, targetFps),
-            global_min = gMin,
-            global_max = gMax,
             frames = frames
         };
     }
-
-    /// <summary>
-    /// 初始化 LineRenderer 外观设置。
-    /// </summary>
     private void ConfigureLineRenderer()
     {
         lineRenderer.useWorldSpace = useWorldSpace;
         lineRenderer.widthMultiplier = lineWidth;
-        lineRenderer.numCapVertices = 2; // 轻微圆角
+        lineRenderer.numCapVertices = 2;
         lineRenderer.numCornerVertices = 2;
         lineRenderer.textureMode = LineTextureMode.Stretch;
         lineRenderer.shadowCastingMode = UnityEngine.Rendering.ShadowCastingMode.Off;
@@ -303,35 +256,27 @@ public class DasVisualizer : MonoBehaviour
         lineRenderer.startColor = Color.white;
         lineRenderer.endColor = Color.white;
     }
-
-    /// <summary>
-    /// 按照控制点列表将等距采样点投射到多段折线上。
-    /// </summary>
     private void BuildPolylineSamples(int count)
     {
         basePositions = new Vector3[count];
         deformedPositions = new Vector3[count];
-
         if (controlPoints == null || controlPoints.Count < 2)
         {
-            Debug.LogError("需要至少两个控制点来生成折线。");
+            Debug.LogError("Need at least two control points.");
             for (int i = 0; i < count; i++) basePositions[i] = Vector3.zero;
             lineRenderer.positionCount = count;
             lineRenderer.SetPositions(basePositions);
             return;
         }
-
         int segmentCount = controlPoints.Count - 1;
         float[] segLengths = new float[segmentCount];
         float total = 0f;
-
         for (int s = 0; s < segmentCount; s++)
         {
             float len = Vector3.Distance(controlPoints[s], controlPoints[s + 1]);
             segLengths[s] = len;
             total += len;
         }
-
         if (total <= Mathf.Epsilon)
         {
             Vector3 p = controlPoints[0];
@@ -343,7 +288,6 @@ public class DasVisualizer : MonoBehaviour
             {
                 float t = count == 1 ? 0f : (float)i / (count - 1);
                 float targetDist = t * total;
-
                 float acc = 0f;
                 for (int s = 0; s < segmentCount; s++)
                 {
@@ -358,133 +302,203 @@ public class DasVisualizer : MonoBehaviour
                 }
             }
         }
-
         lineRenderer.positionCount = count;
         lineRenderer.SetPositions(basePositions);
     }
-
-    /// <summary>
-    /// 将一帧的归一化数据映射为折线形变（凸起）。
-    /// </summary>
     private void UpdateDasGeometry(DasFrame frame)
     {
         if (lineRenderer == null || frame.values == null) return;
-
         int count = frame.values.Length;
         if (count != basePositions?.Length)
         {
-            // 数据长度变化时重新采样位置，以保持一一对应
             BuildPolylineSamples(count);
         }
-
-        // 计算归一化范围
-        float minVal, maxVal;
-        if (normalizationMode == NormalizationMode.Global)
-        {
-            // 使用全局最小最大值
-            minVal = data.global_min;
-            maxVal = data.global_max;
-        }
-        else
-        {
-            // 每帧自适应：计算当前帧的范围
-            minVal = float.MaxValue;
-            maxVal = float.MinValue;
-            foreach (float v in frame.values)
-            {
-                if (v < minVal) minVal = v;
-                if (v > maxVal) maxVal = v;
-            }
-        }
-
-        // 应用百分位裁剪去除异常值
-        if (percentileClip > 0.01f)
-        {
-            float[] sortedValues = new float[frame.values.Length];
-            System.Array.Copy(frame.values, sortedValues, frame.values.Length);
-            System.Array.Sort(sortedValues);
-
-            int clipCount = Mathf.FloorToInt(sortedValues.Length * percentileClip / 100f);
-            if (clipCount > 0 && clipCount < sortedValues.Length / 2)
-            {
-                minVal = sortedValues[clipCount];
-                maxVal = sortedValues[sortedValues.Length - 1 - clipCount];
-            }
-        }
-
-        // 防止除零
-        float range = maxVal - minVal;
-        if (range < 1e-6f) range = 1f;
-
         Vector3 dir = displacementDirection.sqrMagnitude > 1e-6f
             ? displacementDirection.normalized
             : Vector3.up;
-
         for (int i = 0; i < count; i++)
         {
-            // 归一化到 [0, 1]
-            float normalizedValue = (frame.values[i] - minVal) / range;
-            
-            // 对比度增强
-            if (contrastBoost > 1.01f)
-            {
-                // 使用 pow 函数增强对比度，中心值保持在 0.5
-                normalizedValue = Mathf.Pow(normalizedValue, 1f / contrastBoost);
-            }
-            
-            // 限制在 [0, 1] 范围
-            normalizedValue = Mathf.Clamp01(normalizedValue);
-
-            // 沿指定方向产生凸起
-            deformedPositions[i] = basePositions[i] + dir * (normalizedValue * heightScale);
+            float v = frame.values[i];
+            if (!IsFinite(v)) v = 0f;
+            float raw = v * rawValueScale;
+            deformedPositions[i] = basePositions[i] + dir * (raw * heightScale);
         }
-
         lineRenderer.SetPositions(deformedPositions);
     }
-
+    private static bool IsFinite(float v)
+    {
+        return !(float.IsNaN(v) || float.IsInfinity(v));
+    }
+    private void StartStream()
+    {
+        if (streamRunning) return;
+        streamRunning = true;
+        streamThread = new Thread(StreamLoop);
+        streamThread.IsBackground = true;
+        streamThread.Start();
+        Debug.Log($"DasVisualizer: UDP listen {udpListenIp}:{udpListenPort}");
+    }
+    private void StopStream()
+    {
+        streamRunning = false;
+        try
+        {
+            if (udpClient != null)
+            {
+                udpClient.Close();
+                udpClient = null;
+            }
+        }
+        catch { }
+        if (streamThread != null)
+        {
+            try { streamThread.Join(200); } catch { }
+            streamThread = null;
+        }
+    }
+    private void StreamLoop()
+    {
+        try
+        {
+            IPEndPoint listenEndPoint = null;
+            if (string.IsNullOrWhiteSpace(udpListenIp))
+            {
+                listenEndPoint = new IPEndPoint(IPAddress.Any, udpListenPort);
+            }
+            else
+            {
+                listenEndPoint = new IPEndPoint(IPAddress.Parse(udpListenIp), udpListenPort);
+            }
+            udpClient = new UdpClient(listenEndPoint);
+            udpClient.Client.ReceiveTimeout = 1000;
+            var remote = new IPEndPoint(IPAddress.Any, 0);
+            while (streamRunning)
+            {
+                byte[] bytes = null;
+                try
+                {
+                    bytes = udpClient.Receive(ref remote);
+                }
+                catch (SocketException se)
+                {
+                    if (!streamRunning || se.ErrorCode == 10004 || se.ErrorCode == 10060) continue;
+                    throw;
+                }
+                if (bytes == null || bytes.Length == 0) continue;
+                string payload = System.Text.Encoding.UTF8.GetString(bytes);
+                if (string.IsNullOrWhiteSpace(payload)) continue;
+                string[] lines = payload.Split(new[] { '\n', '\r' }, StringSplitOptions.RemoveEmptyEntries);
+                for (int i = 0; i < lines.Length; i++)
+                {
+                    string line = lines[i].Trim();
+                    if (string.IsNullOrEmpty(line)) continue;
+                    try
+                    {
+                        DasPacket packet = JsonUtility.FromJson<DasPacket>(line);
+                        if (packet != null && packet.signals != null && packet.signals.Length > 0)
+                        {
+                            EnqueuePacket(packet);
+                        }
+                    }
+                    catch
+                    {
+                    }
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Debug.LogWarning($"DasVisualizer: UDP listen failed {ex.Message}");
+        }
+        finally
+        {
+            streamRunning = false;
+        }
+    }
+    private void EnqueuePacket(DasPacket packet)
+    {
+        DasFrame frame = new DasFrame { values = packet.signals };
+        lock (frameLock)
+        {
+            incomingFrames.Enqueue(frame);
+        }
+        if (data == null)
+        {
+            data = new DasData
+            {
+                width = packet.total_channels,
+                height = 1,
+                total_channels = packet.total_channels,
+                fps = Mathf.Max(1, packet.sample_rate),
+                frames = new List<DasFrame>()
+            };
+        }
+        if (packet.sample_rate > 0.01f)
+        {
+            timePerFrame = 1f / packet.sample_rate;
+        }
+    }
+    private void DrainIncomingFrames()
+    {
+        bool gotFirst = false;
+        while (true)
+        {
+            DasFrame frame = null;
+            lock (frameLock)
+            {
+                if (incomingFrames.Count > 0) frame = incomingFrames.Dequeue();
+            }
+            if (frame == null) break;
+            data.frames.Add(frame);
+            gotFirst = gotFirst || data.frames.Count == 1;
+            totalDuration = data.frames.Count * timePerFrame;
+        }
+        if (gotFirst)
+        {
+            BuildPolylineSamples(data.frames[0].values.Length);
+            currentFrameIndex = 0;
+            UpdateDasGeometry(data.frames[currentFrameIndex]);
+        }
+    }
     public void Play()
     {
         isPaused = false;
-        Debug.Log("DasVisualizer: 播放开始");
+        Debug.Log("DasVisualizer: Play");
     }
-
     public void Pause()
     {
         isPaused = true;
-        Debug.Log("DasVisualizer: 已暂停");
+        Debug.Log("DasVisualizer: Pause");
     }
-
     public void TogglePlay()
     {
         isPaused = !isPaused;
-        Debug.Log($"DasVisualizer: {(isPaused ? "已暂停" : "播放开始")}");
+        Debug.Log($"DasVisualizer: {(isPaused ? "Pause" : "Play")}");
     }
-
     public bool IsPaused()
     {
         return isPaused;
     }
-
     public void SetTime(float seconds)
     {
         if (data == null || data.frames == null || data.frames.Count == 0) return;
         if (timePerFrame <= 0f) return;
-
         float clamped = Mathf.Clamp(seconds, 0f, totalDuration);
         int idx = Mathf.Min(data.frames.Count - 1, Mathf.FloorToInt(clamped / timePerFrame));
         currentFrameIndex = idx;
         timer = 0f;
-            UpdateDasGeometry(data.frames[currentFrameIndex]);
+        UpdateDasGeometry(data.frames[currentFrameIndex]);
     }
-
     public float GetCurrentTime()
     {
         return currentFrameIndex * timePerFrame;
     }
-
     public float GetTotalTime()
     {
         return totalDuration;
     }
+    private void OnDestroy()
+    {
+        if (useNetworkStream) StopStream();
+    }
 }
-
