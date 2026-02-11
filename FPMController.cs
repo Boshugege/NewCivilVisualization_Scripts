@@ -12,7 +12,6 @@ public class FPMController : MonoBehaviour
     private RawImage crosshair;
     private Sensor sensor;
     private Seismic seismic;
-    private DasVisualizer dasVisualizer;
 
     private Button playButton;
     private Button pauseButton;
@@ -39,35 +38,19 @@ public class FPMController : MonoBehaviour
         seismic = GameObject.Find("Seismic").GetComponent<Seismic>();
         Assert.IsNotNull(seismic);
 
-        GameObject dasVisualizerObj = GameObject.Find("DasVisualizer");
-        if (dasVisualizerObj != null)
-        {
-            dasVisualizer = dasVisualizerObj.GetComponent<DasVisualizer>();
-            Debug.Log("找到 DasVisualizer");
-        }
-        else
-        {
-            Debug.LogWarning("找不到 DasVisualizer 对象");
-        }
-
         playButton = GameObject.Find("PlayButton")?.GetComponent<Button>();
         playButton.onClick.AddListener(() => { 
             seismic.Play();
-            dasVisualizer.Play();
         });
-
 
         pauseButton = GameObject.Find("PauseButton")?.GetComponent<Button>();
         pauseButton.onClick.AddListener(() => { 
             seismic.Pause();
-            dasVisualizer.Pause();
         });
 
         stopButton = GameObject.Find("StopButton")?.GetComponent<Button>();
         stopButton.onClick.AddListener(() => { 
             seismic.Stop();
-            dasVisualizer.SetTime(0f);
-            dasVisualizer.Pause();
         });
 
         sensorButton = GameObject.Find("SensorButton")?.GetComponent<Button>();
