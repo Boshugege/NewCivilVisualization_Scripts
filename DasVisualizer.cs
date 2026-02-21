@@ -1,4 +1,5 @@
 ﻿using UnityEngine;
+using System.Collections;
 using System.Collections.Generic;
 using System.Net;
 using System.Net.Sockets;
@@ -8,12 +9,6 @@ using System;
 // ════════════════════════════════════════════════════════════════
 //  数据结构
 // ════════════════════════════════════════════════════════════════
-
-/// <summary>一帧 DAS 信号（各通道振幅值）。</summary>
-public class DasFrame
-{
-    public float[] values;
-}
 
 /// <summary>脚步事件（Python 端 packet_type="event" 反序列化后）。</summary>
 public class FootstepEvent
@@ -73,17 +68,6 @@ public class DasVisualizer : MonoBehaviour
     [Tooltip("Auto start listening on Play")]
     public bool autoConnectStream = true;
 
-    // ──────────────────────────────────────────────────────────
-    //  2. DAS 信号线变形
-    // ──────────────────────────────────────────────────────────
-    [Header("DAS Signal Deformation")]
-    [Tooltip("Signal amplitude → height scale factor")]
-    public float heightScale = 1f;
-    [Tooltip("Raw value multiplier (pre‑heightScale)")]
-    public float rawValueScale = 1f;
-    [Tooltip("Displacement direction in LineRenderer space")]
-    public Vector3 displacementDirection = Vector3.up;
-
     [Header("DAS Polyline")]
     [Tooltip("Polyline control points (>=2), defines DAS fiber layout")]
     public List<Vector3> controlPoints = new List<Vector3>
@@ -96,6 +80,9 @@ public class DasVisualizer : MonoBehaviour
     public float lineWidth = 0.2f;
     [Tooltip("Use world space for LineRenderer")]
     public bool useWorldSpace = false;
+    [Tooltip("Static line sample count along control points")]
+    [Range(2, 4096)]
+    public int staticLineSampleCount = 156;
 
     // ──────────────────────────────────────────────────────────
     //  3. 脚步跟踪 — 总控
@@ -226,6 +213,25 @@ public class DasVisualizer : MonoBehaviour
     [Range(8, 128)]
     public int labelFontSize = 48;
 
+    [Header("Footstep Audio (From Event Stream)")]
+    [Tooltip("Play footstep SFX when network footstep events are accepted")]
+    public bool playFootstepAudio = true;
+    [Tooltip("Footstep clip list (uses Player_Footstep_01 if present)")]
+    public AudioClip[] footstepAudioClips;
+    [Tooltip("One-shot volume for each event footstep")]
+    [Range(0f, 1f)]
+    public float footstepAudioVolume = 0.5f;
+    [Tooltip("If false, audio is emitted on path line instead of personOffset height")]
+    public bool footstepAudioUsePersonOffset = false;
+    [Tooltip("Additional offset for audio source position")]
+    public Vector3 footstepAudioOffset = Vector3.zero;
+    [Tooltip("Upper bound for delayed playback from event timestamp spacing (s)")]
+    [Range(0f, 1f)]
+    public float footstepAudioMaxScheduleDelay = 0.25f;
+    [Tooltip("Minimum interval between actual clip emissions (0 = no throttle)")]
+    [Range(0f, 0.2f)]
+    public float footstepAudioMinInterval = 0f;
+
     // ──────────────────────────────────────────────────────────
     //  5. 调试
     // ──────────────────────────────────────────────────────────
@@ -241,17 +247,8 @@ public class DasVisualizer : MonoBehaviour
     // ──────────────────────────────────────────────────────────
     //  Private — DAS 信号
     // ──────────────────────────────────────────────────────────
-    private int totalChannelsFromSignal;            // 从 signal 包同步的通道数
     private LineRenderer lineRenderer;
     private Vector3[] basePositions;
-    private Vector3[] deformedPositions;
-    private bool signalInitialized;                 // 第一个 signal 包到达后 = true
-    private float timePerFrame;
-    private int currentFrameIndex = 0;
-    private float timer = 0f;
-
-    // 信号帧累积缓冲（仅用于流模式连续回放）
-    private List<DasFrame> frameBuffer = new List<DasFrame>();
 
     // ──────────────────────────────────────────────────────────
     //  Private — 网络
@@ -259,8 +256,6 @@ public class DasVisualizer : MonoBehaviour
     private UdpClient udpClient;
     private Thread streamThread;
     private volatile bool streamRunning;
-    private readonly object frameLock = new object();
-    private readonly Queue<DasFrame> incomingFrames = new Queue<DasFrame>();
 
     // ──────────────────────────────────────────────────────────
     //  Private — 脚步跟踪
@@ -271,6 +266,8 @@ public class DasVisualizer : MonoBehaviour
     private readonly List<FootstepEvent> unassignedEvents = new List<FootstepEvent>();
     private int nextTargetId = 1;
     private float latestStreamTime = 0f;
+    private float lastFootstepEventTimestampForAudio = float.NaN;
+    private float lastFootstepAudioPlayWallTime = -999f;
 
     // polyline 段长缓存（坐标映射）
     private float[] segLengthsCache;
@@ -325,6 +322,10 @@ public class DasVisualizer : MonoBehaviour
         lineRenderer.alignment = LineAlignment.View;
 
         CachePolylineSegments();
+        BuildPolylineSamples(Mathf.Max(2, staticLineSampleCount));
+
+        if (playFootstepAudio && (footstepAudioClips == null || footstepAudioClips.Length == 0))
+            Debug.LogWarning("DasVisualizer: playFootstepAudio enabled but no footstepAudioClips assigned.");
 
         if (autoConnectStream)
             StartStream();
@@ -332,29 +333,11 @@ public class DasVisualizer : MonoBehaviour
 
     void Update()
     {
-        // ── 1. 消费信号帧 ──
-        DrainIncomingFrames();
-
-        // ── 2. 消费脚步事件 ──
+        // ── 消费脚步事件 ──
         if (enableFootstepTracking)
             DrainAndProcessEvents();
 
-        // ── 3. DAS 信号回放（连续推进帧索引） ──
-        if (signalInitialized && frameBuffer.Count > 0 && timePerFrame > 0f)
-        {
-            timer += Time.deltaTime;
-            if (timer >= timePerFrame)
-            {
-                if (currentFrameIndex + 1 < frameBuffer.Count)
-                {
-                    currentFrameIndex++;
-                    UpdateDasGeometry(frameBuffer[currentFrameIndex]);
-                }
-                timer -= timePerFrame;
-            }
-        }
-
-        // ── 4. 人物可视化更新 ──
+        // ── 人物可视化更新 ──
         if (enableFootstepTracking)
         {
             UpdateTargetLifecycles();
@@ -388,7 +371,6 @@ public class DasVisualizer : MonoBehaviour
     private void BuildPolylineSamples(int count)
     {
         basePositions = new Vector3[count];
-        deformedPositions = new Vector3[count];
         if (controlPoints == null || controlPoints.Count < 2)
         {
             Debug.LogError("Need at least two control points.");
@@ -435,30 +417,6 @@ public class DasVisualizer : MonoBehaviour
         lineRenderer.SetPositions(basePositions);
     }
 
-    private void UpdateDasGeometry(DasFrame frame)
-    {
-        if (lineRenderer == null || frame.values == null) return;
-        int count = frame.values.Length;
-        if (count != basePositions?.Length)
-            BuildPolylineSamples(count);
-
-        Vector3 dir = displacementDirection.sqrMagnitude > 1e-6f
-            ? displacementDirection.normalized
-            : Vector3.up;
-        for (int i = 0; i < count; i++)
-        {
-            float v = frame.values[i];
-            if (!IsFinite(v)) v = 0f;
-            deformedPositions[i] = basePositions[i] + dir * (v * rawValueScale * heightScale);
-        }
-        lineRenderer.SetPositions(deformedPositions);
-    }
-
-    private static bool IsFinite(float v)
-    {
-        return !(float.IsNaN(v) || float.IsInfinity(v));
-    }
-
     // ══════════════════════════════════════════════════════════
     //  UDP 网络接收（signal / event 分流）
     // ══════════════════════════════════════════════════════════
@@ -466,6 +424,8 @@ public class DasVisualizer : MonoBehaviour
     private void StartStream()
     {
         if (streamRunning) return;
+        lastFootstepEventTimestampForAudio = float.NaN;
+        lastFootstepAudioPlayWallTime = -999f;
         streamRunning = true;
         streamThread = new Thread(StreamLoop);
         streamThread.IsBackground = true;
@@ -485,7 +445,7 @@ public class DasVisualizer : MonoBehaviour
     }
 
     /// <summary>
-    /// 后台线程：持续接收 UDP 包，按 packet_type 分流到 incomingFrames 或 incomingEvents。
+    /// 后台线程：持续接收 UDP 包，按 packet_type 分流到 event 或 signal 元数据同步。
     /// 支持乱序、丢包、突发流量（UDP 天然特性）。
     /// </summary>
     private void StreamLoop()
@@ -544,8 +504,8 @@ public class DasVisualizer : MonoBehaviour
                         else
                         {
                             DasPacket packet = JsonUtility.FromJson<DasPacket>(line);
-                            if (packet != null && packet.signals != null && packet.signals.Length > 0)
-                                EnqueueSignalPacket(packet);
+                            if (packet != null)
+                                SyncSignalMetadata(packet);
                         }
                     }
                     catch { /* 解析失败静默跳过 */ }
@@ -576,53 +536,13 @@ public class DasVisualizer : MonoBehaviour
         return json.Substring(q1 + 1, q2 - q1 - 1);
     }
 
-    private void EnqueueSignalPacket(DasPacket packet)
+    private void SyncSignalMetadata(DasPacket packet)
     {
-        lock (frameLock)
-        {
-            incomingFrames.Enqueue(new DasFrame { values = packet.signals });
-        }
-        if (packet.sample_rate > 0.01f)
-            timePerFrame = 1f / packet.sample_rate;
+        // 仅保留通道数与时间戳同步，不再消费 signals 振幅做线条形变。
         if (packet.total_channels > 0)
-            totalChannelsFromSignal = packet.total_channels;
+            totalChannelCount = packet.total_channels;
         if (packet.timestamp > latestStreamTime)
             latestStreamTime = packet.timestamp;
-    }
-
-    /// <summary>主线程：把后台收到的信号帧逐个入缓冲并驱动第一帧初始化。</summary>
-    private void DrainIncomingFrames()
-    {
-        bool gotFirst = false;
-        while (true)
-        {
-            DasFrame frame = null;
-            lock (frameLock)
-            {
-                if (incomingFrames.Count > 0) frame = incomingFrames.Dequeue();
-            }
-            if (frame == null) break;
-
-            frameBuffer.Add(frame);
-            gotFirst = gotFirst || frameBuffer.Count == 1;
-        }
-
-        if (gotFirst)
-        {
-            BuildPolylineSamples(frameBuffer[0].values.Length);
-            currentFrameIndex = 0;
-            signalInitialized = true;
-            UpdateDasGeometry(frameBuffer[0]);
-
-            // 同步通道数
-            if (totalChannelsFromSignal > 0)
-                totalChannelCount = totalChannelsFromSignal;
-        }
-        // 持续同步通道数（可能在后续包中更新）
-        else if (totalChannelsFromSignal > 0 && totalChannelsFromSignal != totalChannelCount)
-        {
-            totalChannelCount = totalChannelsFromSignal;
-        }
     }
 
     // ══════════════════════════════════════════════════════════
@@ -633,8 +553,8 @@ public class DasVisualizer : MonoBehaviour
     public void Pause() { Debug.Log("DasVisualizer: Pause"); }
     public void TogglePlay() { Debug.Log("DasVisualizer: Toggle"); }
 
-    public float GetCurrentTime() { return currentFrameIndex * timePerFrame; }
-    public float GetTotalTime()   { return frameBuffer.Count * timePerFrame; }
+    public float GetCurrentTime() { return 0f; }
+    public float GetTotalTime()   { return 0f; }
 
     // ══════════════════════════════════════════════════════════
     //  坐标映射：channel_index ↔ 世界坐标
@@ -712,6 +632,7 @@ public class DasVisualizer : MonoBehaviour
             if (logFootstepEvents)
                 Debug.Log($"[Footstep] t={evt.timestamp:F3} ch={evt.channelIndex} conf={evt.confidence:F3}");
 
+            TryPlayFootstepAudio(evt);
             ProcessFootstepEvent(evt);
             processed++;
         }
@@ -733,6 +654,78 @@ public class DasVisualizer : MonoBehaviour
 
         unassignedEvents.Add(evt);
         TryFormNewTarget(evt);
+    }
+
+    private void TryPlayFootstepAudio(FootstepEvent evt)
+    {
+        if (!playFootstepAudio) return;
+        if (footstepAudioClips == null || footstepAudioClips.Length == 0) return;
+
+        Vector3 worldPos = GetFootstepAudioWorldPosition(evt.channelIndex);
+
+        bool hasFiniteTimestamp = !(float.IsNaN(evt.timestamp) || float.IsInfinity(evt.timestamp));
+        float delay = 0f;
+        if (hasFiniteTimestamp && !float.IsNaN(lastFootstepEventTimestampForAudio))
+        {
+            float dt = evt.timestamp - lastFootstepEventTimestampForAudio;
+            if (dt > 0f)
+                delay = Mathf.Min(dt, footstepAudioMaxScheduleDelay);
+        }
+        if (hasFiniteTimestamp)
+        {
+            if (float.IsNaN(lastFootstepEventTimestampForAudio))
+                lastFootstepEventTimestampForAudio = evt.timestamp;
+            else
+                lastFootstepEventTimestampForAudio = Mathf.Max(lastFootstepEventTimestampForAudio, evt.timestamp);
+        }
+
+        if (delay <= 0f)
+            PlayFootstepClipAt(worldPos);
+        else
+            StartCoroutine(PlayFootstepClipDelayed(worldPos, delay));
+    }
+
+    private Vector3 GetFootstepAudioWorldPosition(int channelIndex)
+    {
+        Vector3 pathSpacePos = ChannelToWorldPosition(channelIndex, totalChannelCount);
+        if (!footstepAudioUsePersonOffset)
+            pathSpacePos -= personOffset;
+        pathSpacePos += footstepAudioOffset;
+        return useWorldSpace ? pathSpacePos : transform.TransformPoint(pathSpacePos);
+    }
+
+    private IEnumerator PlayFootstepClipDelayed(Vector3 worldPos, float delay)
+    {
+        if (delay > 0f)
+            yield return new WaitForSeconds(delay);
+        PlayFootstepClipAt(worldPos);
+    }
+
+    private void PlayFootstepClipAt(Vector3 worldPos)
+    {
+        if (footstepAudioClips == null || footstepAudioClips.Length == 0) return;
+        if (footstepAudioMinInterval > 0f
+            && (Time.unscaledTime - lastFootstepAudioPlayWallTime) < footstepAudioMinInterval) return;
+
+        AudioClip clip = GetFootstepClip01();
+        if (clip == null) return;
+
+        lastFootstepAudioPlayWallTime = Time.unscaledTime;
+        AudioSource.PlayClipAtPoint(clip, worldPos, footstepAudioVolume);
+    }
+
+    private AudioClip GetFootstepClip01()
+    {
+        if (footstepAudioClips == null || footstepAudioClips.Length == 0) return null;
+
+        // Prefer explicit Player_Footstep_01
+        for (int i = 0; i < footstepAudioClips.Length; i++)
+        {
+            var c = footstepAudioClips[i];
+            if (c != null && c.name.IndexOf("Player_Footstep_01", StringComparison.OrdinalIgnoreCase) >= 0)
+                return c;
+        }
+        return null;
     }
 
     /// <summary>
@@ -1044,12 +1037,38 @@ public class DasVisualizer : MonoBehaviour
             if (armTexture == null) armTexture = FindTex("Armature_Arms_AlbedoTransparency");
             if (bodyTexture == null) bodyTexture = FindTex("Armature_Body_AlbedoTransparency");
             if (legTexture == null) legTexture = FindTex("Armature_Legs_AlbedoTransparency");
+
+            // Auto-locate footstep SFX
+            if (footstepAudioClips == null || footstepAudioClips.Length == 0)
+                footstepAudioClips = FindFootstepSfx();
         }
     }
     private Texture2D FindTex(string name)
     {
         var guids = UnityEditor.AssetDatabase.FindAssets(name + " t:Texture2D", new[] { "Assets/StarterAssets" });
         return guids.Length > 0 ? UnityEditor.AssetDatabase.LoadAssetAtPath<Texture2D>(UnityEditor.AssetDatabase.GUIDToAssetPath(guids[0])) : null;
+    }
+
+    private AudioClip[] FindFootstepSfx()
+    {
+        var guids = UnityEditor.AssetDatabase.FindAssets(
+            "Player_Footstep_01 t:AudioClip",
+            new[] { "Assets/StarterAssets/ThirdPersonController/Character/Sfx" });
+        if (guids == null || guids.Length == 0)
+            return new AudioClip[0];
+
+        string bestPath = null;
+        for (int i = 0; i < guids.Length; i++)
+        {
+            string path = UnityEditor.AssetDatabase.GUIDToAssetPath(guids[i]);
+            if (bestPath == null || string.Compare(path, bestPath, StringComparison.OrdinalIgnoreCase) < 0)
+                bestPath = path;
+        }
+        if (string.IsNullOrEmpty(bestPath))
+            return new AudioClip[0];
+
+        var clip01 = UnityEditor.AssetDatabase.LoadAssetAtPath<AudioClip>(bestPath);
+        return clip01 != null ? new[] { clip01 } : new AudioClip[0];
     }
 #endif
 
