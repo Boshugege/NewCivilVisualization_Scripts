@@ -25,7 +25,7 @@ PublicDependencyModuleNames.AddRange(new string[] {
 
 ## 第二步：创建 C++ 数据接收与可视化组件
 
-在引擎中创建一个继承自 `Actor` 的 C++ 类，命名为 `DasVisualizerActor`。
+原版 Unity 插件包含了完整的 **实体状态机（聚集、Tentative、Confirmed、Lost）、EMA 坐标平滑**以及**视觉上的插值移动（Lerp）和淡入淡出**。为了在 Unreal 中完美复刻，我们通过 `Tick`（每帧更新）来接管平滑和实体生命周期逻辑，而不只是在收到网络包时瞬间移动。
 
 ### DasVisualizerActor.h (头文件)
 ```cpp
@@ -36,10 +36,46 @@ PublicDependencyModuleNames.AddRange(new string[] {
 #include "Networking.h"
 #include "Sockets.h"
 #include "Common/UdpSocketReceiver.h"
+#include "Containers/Queue.h"
 #include "DasVisualizerActor.generated.h"
 
 class USplineComponent;
-class UStaticMeshComponent;
+
+// --- 数据结构 ---
+USTRUCT()
+struct FFootstepEvent
+{
+	GENERATED_BODY()
+	float Timestamp = 0.0f;
+	int32 ChannelIndex = 0;
+	float Confidence = 0.0f;
+};
+
+UENUM()
+enum class ETargetState : uint8
+{
+	Tentative,
+	Confirmed,
+	Lost,
+	Removed
+};
+
+USTRUCT()
+struct FTrackedTarget
+{
+	GENERATED_BODY()
+	int32 ID = 0;
+	ETargetState State = ETargetState::Tentative;
+	
+	float ChannelPosition = 0.0f; // EMA 平滑后的逻辑通道位置
+	float LastEventTime = 0.0f;
+	
+	// 表现层
+	UPROPERTY(Transient)
+	AActor* VisualActor = nullptr; // 对应的游戏内模型实体
+	
+	float ActualDisplayDistance = 0.0f; // 当前实际模型在哪
+};
 
 UCLASS()
 class YOURPROJECT_API ADasVisualizerActor : public AActor
@@ -54,33 +90,54 @@ protected:
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
 public:	
+	virtual void Tick(float DeltaTime) override;
+
 	// --- 组件 ---
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "DAS")
 	USceneComponent* Root;
 
-	// 用于模拟沿着光纤布置的路径
+	// 光纤路径
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "DAS")
 	USplineComponent* FiberPath;
 
-	// 替代小人的占位模型（比如一个方块或胶囊体）
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "DAS")
-	UStaticMeshComponent* PlaceholderMesh;
-
 	// --- 参数设置 ---
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DAS|Network")
-	int32 UdpListenPort;
+	int32 UdpListenPort = 9000;
 
-	// 每个 Channel 对应在这个线条上多少距离（Unreal 单位默认是厘米）
-	// 假如两米一个采样点，这里填 200
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DAS|Tracking")
-	float ChannelDistanceMultiplier;
+	float ChannelDistanceMultiplier = 200.0f; // 每个通道占多少厘米
+
+	// 小人的可生成类 (在蓝图里指定一个做好的 BP_Person)
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DAS|Visuals")
+	TSubclassOf<AActor> PersonClassToSpawn;
+
+	// 平滑速度
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DAS|Visuals")
+	float PositionSmoothSpeed = 5.0f;
+	
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "DAS|Visuals")
+	float TrackingPositionAlpha = 0.35f;
 
 private:
 	FSocket* ListenSocket;
 	FUdpSocketReceiver* UdpReceiver;
 
-	// UDP接收回调
+	// 线程安全的事件队列
+	TQueue<FFootstepEvent, EQueueMode::Spsc> IncomingEvents;
+	
+	// 活跃目标列表
+	UPROPERTY(Transient)
+	TArray<FTrackedTarget> ActiveTargets;
+	int32 NextTargetId = 1;
+
+	// 系统时间
+	float CurrentStreamTime = 0.0f;
+
 	void OnUdpDataReceived(const FArrayReaderPtr& ArrayReaderPtr, const FIPv4Endpoint& EndPt);
+	
+	// 逻辑处理
+	void ProcessEvents();
+	void UpdateVisuals(float DeltaTime);
 };
 ```
 
@@ -88,37 +145,27 @@ private:
 ```cpp
 #include "DasVisualizerActor.h"
 #include "Components/SplineComponent.h"
-#include "Components/StaticMeshComponent.h"
-#include "Async/Async.h"
 #include "Serialization/JsonReader.h"
 #include "Serialization/JsonSerializer.h"
+#include "Async/Async.h"
 
 // 注意：将 YOURPROJECT_API 宏替换为你自己的项目宏名
 
 ADasVisualizerActor::ADasVisualizerActor()
 {
-	PrimaryActorTick.bCanEverTick = false;
+	PrimaryActorTick.bCanEverTick = true; // ★ 开启 Tick 用于平滑和处理
 
 	Root = CreateDefaultSubobject<USceneComponent>(TEXT("Root"));
 	RootComponent = Root;
 
 	FiberPath = CreateDefaultSubobject<USplineComponent>(TEXT("FiberPath"));
 	FiberPath->SetupAttachment(RootComponent);
-
-	PlaceholderMesh = CreateDefaultSubobject<UStaticMeshComponent>(TEXT("PlaceholderMesh"));
-	PlaceholderMesh->SetupAttachment(RootComponent);
-	// 默认隐藏，收到数据再点亮
-	PlaceholderMesh->SetVisibility(false); 
-    
-	UdpListenPort = 9000;
-	ChannelDistanceMultiplier = 200.0f;
 }
 
 void ADasVisualizerActor::BeginPlay()
 {
 	Super::BeginPlay();
 
-	// 1. 初始化并监听 UDP 端口
 	FIPv4Address Addr = FIPv4Address::Any;
 	FIPv4Endpoint Endpoint(Addr, UdpListenPort);
 
@@ -131,18 +178,17 @@ void ADasVisualizerActor::BeginPlay()
 
 	if (ListenSocket)
 	{
-		FTimespan ThreadWaitTime = FTimespan::FromMilliseconds(100);
+		FTimespan ThreadWaitTime = FTimespan::FromMilliseconds(10);
 		UdpReceiver = new FUdpSocketReceiver(ListenSocket, ThreadWaitTime, TEXT("UdpReceiverThread"));
 		UdpReceiver->OnDataReceived().BindUObject(this, &ADasVisualizerActor::OnUdpDataReceived);
 		UdpReceiver->Start();
-		UE_LOG(LogTemp, Warning, TEXT("DAS UDP Listening on Port: %d"), UdpListenPort);
+        UE_LOG(LogTemp, Warning, TEXT("DAS 跟踪版 UDP 已启动，端口: %d"), UdpListenPort);
 	}
 }
 
 void ADasVisualizerActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
 	Super::EndPlay(EndPlayReason);
-	
 	if (UdpReceiver)
 	{
 		UdpReceiver->Stop();
@@ -159,10 +205,10 @@ void ADasVisualizerActor::EndPlay(const EEndPlayReason::Type EndPlayReason)
 
 void ADasVisualizerActor::OnUdpDataReceived(const FArrayReaderPtr& ArrayReaderPtr, const FIPv4Endpoint& EndPt)
 {
-	// 2. 将收到的字节流转换为字符串 (UTF-8)
-	FString PayloadString = FString(ANSI_TO_TCHAR(reinterpret_cast<const char*>(ArrayReaderPtr->GetData())));
+	TArray<uint8> ReceivedData = *ArrayReaderPtr;
+	ReceivedData.Add(0); 
+	FString PayloadString = FString(UTF8_TO_TCHAR(ReceivedData.GetData()));
 
-	// 处理了多行 JSON 粘包，按 \n 分割
 	TArray<FString> JsonLines;
 	PayloadString.ParseIntoArray(JsonLines, TEXT("\n"), true);
 
@@ -174,30 +220,135 @@ void ADasVisualizerActor::OnUdpDataReceived(const FArrayReaderPtr& ArrayReaderPt
 		if (FJsonSerializer::Deserialize(Reader, JsonObject) && JsonObject.IsValid())
 		{
 			FString PacketType;
-			int32 ChannelIndex = 0;
-			
-			// 3. 读取 packet_type 和 channel_index
-			if (JsonObject->TryGetStringField(TEXT("packet_type"), PacketType) && 
-				PacketType == TEXT("event") &&
-				JsonObject->TryGetNumberField(TEXT("channel_index"), ChannelIndex))
+			if (JsonObject->TryGetStringField(TEXT("packet_type"), PacketType) && PacketType == TEXT("event"))
 			{
-				float TargetDistance = ChannelIndex * ChannelDistanceMultiplier;
+				FFootstepEvent NewEvent;
+				JsonObject->TryGetNumberField(TEXT("timestamp"), NewEvent.Timestamp);
+				JsonObject->TryGetNumberField(TEXT("channel_index"), NewEvent.ChannelIndex);
+				JsonObject->TryGetNumberField(TEXT("confidence"), NewEvent.Confidence);
+				
+				// 将解析好的数据塞进队列，交给主线程 Tick 处理
+				IncomingEvents.Enqueue(NewEvent);
+			}
+		}
+	}
+}
 
-				// 4. 返回主线程更新渲染层（重要：不能在网络线程直接更新组件位置）
-				AsyncTask(ENamedThreads::GameThread, [this, TargetDistance]()
-				{
-					if (FiberPath && PlaceholderMesh)
-					{
-						// 如果之前是隐藏的，现在显示出来
-						PlaceholderMesh->SetVisibility(true);
+void ADasVisualizerActor::Tick(float DeltaTime)
+{
+	Super::Tick(DeltaTime);
+	
+	CurrentStreamTime += DeltaTime; // 简单的时间推移模拟
 
-						// 约束距离，防止超界
-						float ClampedDist = FMath::Clamp(TargetDistance, 0.0f, FiberPath->GetSplineLength());
-						
-						// 根据计算出的距离，在 Spline(样条线) 上获取对应的三维世界坐标
-						FVector NewLocation = FiberPath->GetLocationAtDistanceAlongSpline(ClampedDist, ESplineCoordinateSpace::World);
-						
-						// 加上一个 Z 轴偏移让物体悬浮在路径上方
+	ProcessEvents();
+	UpdateVisuals(DeltaTime);
+}
+
+void ADasVisualizerActor::ProcessEvents()
+{
+	FFootstepEvent EventData;
+	// 每次将队列里的数据抽干处理
+	while (IncomingEvents.Dequeue(EventData))
+	{
+		bool bAssociated = false;
+
+		// 1. 尝试将新事件关联到存活的目标上
+		for (FTrackedTarget& Target : ActiveTargets)
+		{
+			float Dist = FMath::Abs(Target.ChannelPosition - EventData.ChannelIndex);
+			// 距离较近则认作同一个人继续走动 (对应 Unity 里的 maxAssociationDistance)
+			if (Dist < 15.0f) 
+			{
+				// 用 EMA 平滑更新该人的虚拟通道坐标
+				Target.ChannelPosition = FMath::Lerp(Target.ChannelPosition, (float)EventData.ChannelIndex, TrackingPositionAlpha);
+				Target.LastEventTime = CurrentStreamTime;
+				Target.State = ETargetState::Confirmed;
+				bAssociated = true;
+				break;
+			}
+		}
+
+		// 2. 如果是一个全新很远地方的脚步（触发新角色）
+		if (!bAssociated)
+		{
+			FTrackedTarget NewTarget;
+			NewTarget.ID = NextTargetId++;
+			NewTarget.ChannelPosition = EventData.ChannelIndex;
+			NewTarget.LastEventTime = CurrentStreamTime;
+			NewTarget.State = ETargetState::Tentative;
+			
+			// 把其实际显示坐标就初始化在出生点
+			NewTarget.ActualDisplayDistance = NewTarget.ChannelPosition * ChannelDistanceMultiplier;
+
+			// 生成指定的模型 (类似 Instantiate)，要在蓝图配置 PersonClassToSpawn
+			if (PersonClassToSpawn)
+			{
+				FActorSpawnParameters SpawnParams;
+				NewTarget.VisualActor = GetWorld()->SpawnActor<AActor>(PersonClassToSpawn, FVector::ZeroVector, FRotator::ZeroRotator, SpawnParams);
+			}
+			
+			ActiveTargets.Add(NewTarget);
+		}
+	}
+}
+
+void ADasVisualizerActor::UpdateVisuals(float DeltaTime)
+{
+	for (int32 i = ActiveTargets.Num() - 1; i >= 0; i--)
+	{
+		FTrackedTarget& Target = ActiveTargets[i];
+
+		// 生命周期管理：3秒没信号判定为丢失，5秒彻底清除模型 (对应 lostTimeoutSeconds 和 removeTimeoutSeconds)
+		float TimeSinceLastEvent = CurrentStreamTime - Target.LastEventTime;
+		if (TimeSinceLastEvent > 3.0f && Target.State == ETargetState::Confirmed)
+		{
+			Target.State = ETargetState::Lost;
+		}
+		if (TimeSinceLastEvent > 5.0f)
+		{
+			if (Target.VisualActor)
+			{
+				Target.VisualActor->Destroy();
+			}
+			ActiveTargets.RemoveAt(i);
+			continue;
+		}
+
+		// 执行类似原版的 Visual 平滑
+		if (Target.VisualActor && FiberPath)
+		{
+			// 本阵列对应的目标绝对距离
+			float TargetRealDistance = Target.ChannelPosition * ChannelDistanceMultiplier;
+			float MaxSplineLen = FiberPath->GetSplineLength();
+			TargetRealDistance = FMath::Clamp(TargetRealDistance, 0.0f, MaxSplineLen);
+
+			// ★ 像原版中那样，利用 FInterpTo 随着位置平滑地 Lerp(插值)，而不是瞬移！★
+			Target.ActualDisplayDistance = FMath::FInterpTo(Target.ActualDisplayDistance, TargetRealDistance, DeltaTime, PositionSmoothSpeed);
+
+			FVector NewLocation = FiberPath->GetLocationAtDistanceAlongSpline(Target.ActualDisplayDistance, ESplineCoordinateSpace::World);
+			
+			// 可以让模型稍微高于地面
+			NewLocation.Z += 100.0f;
+            
+			FRotator NewRotation = FiberPath->GetRotationAtDistanceAlongSpline(Target.ActualDisplayDistance, ESplineCoordinateSpace::World);
+			
+			Target.VisualActor->SetActorLocationAndRotation(NewLocation, NewRotation);
+		}
+	}
+}
+```
+
+---
+
+## 第三步：在 Unreal 编辑器里的新变化
+
+1. 你需要先去新建一个普通的 **Blueprint Class (类型为 Actor)**，比如叫 `BP_PersonTarget`。
+2. 双击打开 `BP_PersonTarget`，在里面加一个 `Static Mesh` 组件（设定为方块或胶囊体），再加你想展示的粒子特效或材质。
+3. 打开我们在主场景中放的 `BP_DasVisualizer`，在右侧细节面板找到新增的 **Person Class To Spawn** 这个属性。把它设置为你刚刚创建的 `BP_PersonTarget`。
+4. **效果**：现在它不再是简单挪动一个方块，而是完整的模拟了 C# 中的逻辑：
+   - 如果收到数据，它会自动**Spawn(生成)** 出一个你配置的小方块放在对应位置。
+   - 如果继续连续收到数据，小方块会**以平滑插值（Lerp）的方式向着目标位置滑动**。
+   - 如果好几秒都没有收到某个人的新脚步，那个小方块会自己进入 Lost 状态并在 5 秒后被 **Destroy(销毁)**！如果有两处远距离的脚步，它会生成两个方块！
 						NewLocation.Z += 100.0f; 
 						
 						PlaceholderMesh->SetWorldLocation(NewLocation);
